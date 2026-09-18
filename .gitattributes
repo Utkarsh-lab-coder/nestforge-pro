@@ -1,0 +1,7 @@
+# Keep LF line endings everywhere. build.js reproduces dist/ byte for byte from
+# the sources, and Windows converting to CRLF on checkout would change every line.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary

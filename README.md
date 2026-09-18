@@ -1,37 +1,113 @@
 # NestForge Pro
 
-A DXF nesting optimiser for leather and sheet cutting, built for footwear production.
+Leather cutting-room software for footwear production. It nests DXF and SVG pattern pieces onto a
+hide or a sheet with as little waste as possible, then works out what the cut actually costs.
 
-Open `index.html` in a browser. There is no build step, no server and no dependencies — the whole
-application is a single self-contained file.
+To use it, open `dist/nestforge-pro.html` in a browser. It is one self-contained file.
 
 ## What it does
 
-Nesting is the problem of fitting cut pieces onto a hide or sheet with as little waste as possible.
-On a real cutting floor that waste is the single biggest material cost, and leather makes it harder
-than sheet metal because the material is irregular, has a grain direction, and has defects you must
-cut around.
+**Two nesting engines.**
 
-- **Imports DXF, SVG and images.** Pattern pieces come out of whatever CAD the pattern master used.
-- **Nests with grain and mirror constraints.** Left and right pieces flip; a vamp cut across the
-  grain is a rejected shoe.
-- **Zones.** Mark regions of the hide so pieces are kept off defects and off the belly.
-- **Costing, per piece or per pair.** Enter brand, article, component and material, and the sheet
-  tells you what the cut actually costs.
-- **Export with traceability.** Sheets are stamped with order number and operator, so a cut sheet
-  on the floor can be traced back to the job.
+- **Polygon engine, using no-fit polygons.** Exact geometry. For each piece it computes the Minkowski
+  no-fit polygon against every piece already placed, subtracts those from the sheet's inner-fit
+  region with Clipper, and takes the best bottom-left position across the allowed rotations. It
+  captures true concave interlocking, and the gap between pieces is an exact polygon offset rather
+  than a pixel dilation, so precision does not depend on sheet size.
+- **Raster engine.** A grid and skyline nester. Faster per placement, and the basis for Cutting Flow.
 
-## Why it exists
+**Cutting Flow.** Lays pieces out in lanes for a clean CNC cutting path. It runs sixteen complete
+layouts, eight angles across horizontal and vertical lanes, and keeps whichever places the most
+pieces. With Cutting Flow on it also runs the polygon engine and keeps the better of the two, so
+curvy asymmetric parts such as vamps get tight interlock without anyone choosing an engine.
 
-I spent four and a half years in footwear manufacturing, first at Redtape and now at KNS Shoetech.
-Cutting rooms nest by hand or pay for software priced for European plants. This is the tool I
-wanted on the floor.
+**Rules for leather.**
 
-## Status
+- Hide quality zones: Butt, Shoulder, Neck, Belly, Fore Flank and Hind Flank. Each component can be
+  set to Must, Optional or None for any zone.
+- Per component: allowed rotations, mirroring, grain direction, tolerance, or fixed.
+- Hide defects, which can be edited or regenerated.
+- A guaranteed minimum gap. Both engines are built so rounding can never leave two pieces touching.
 
-Working and usable. Built as a single file deliberately so it can be dropped onto any machine in a
-factory without an install, an account or a network connection.
+**Norm calculator.** Material consumption per piece by the parallelogram method on a 1 cm² grid: net
+and gross area, interlock waste, efficiency, and allowance grades from A (5%) to E (25%).
+
+**Costing and reports.** Per piece or per pair, with brand, article, component, material and custom
+fields, exported to Excel or PDF. Consolidated reports across several specs.
+
+**Import and export.** Pattern pieces in from DXF (lines, arcs, polyline bulges, B-splines) or SVG,
+from individual files, a folder or a ZIP. Custom sheet shapes from DXF, SVG or an image. Export to
+DXF, SVG, PDF or ZIP, optionally stamped with the date, the time or custom text such as an order
+number. Projects save and reopen as JSON.
+
+## Running it
+
+| File | Use |
+|---|---|
+| `dist/nestforge-pro.html` | The whole app in one file. This is what you give people. |
+| `index.html` | The same app loaded straight from `src/`. Open this while developing: edit a file, refresh, no build step. |
+
+Nesting runs fully offline. The Excel, PDF and ZIP features load JSZip, ExcelJS and jsPDF from a
+CDN, so those three need a connection.
+
+## Building
+
+```
+node build.js
+```
+
+Reads `index.html`, inlines the stylesheet and every script it references, and writes
+`dist/nestforge-pro.html`. It needs Node and nothing else, no packages.
+
+## Structure
+
+```
+index.html                  development entry: page markup, and the load order of every script
+build.js                    builds dist/nestforge-pro.html
+src/
+  styles/app.css
+  data/hide-data.js         normalised hide outline, zone curves and zone labels
+  geometry/
+    clipper-shim.js         CLIPPER_SCALE: integer precision of 0.0001 mm
+    geo-utils.js            bounding box, area, translate, scale, rotate, mirror, perimeter
+    poly-utils.js           PU: polygon helpers and segment intersection
+    clipper-global.js       exposes the vendored Clipper as ClipperLib; design notes for the NFP engine
+  parser/
+    dxf-parser.js           DXF entities, bulges, B-splines, splitting paths at gaps
+    svg-parser.js           SVG paths
+  nesting/
+    rasterizer.js           rasterising polygons, gap dilation, skyline column tops
+    raster-engine.js        NestEngineRaster: grid and skyline nester, Cutting Flow
+    leather.js              LeatherSheet: the hide model
+    nfp.js                  no-fit polygons from Minkowski sums
+    poly-engine.js          PolyNestEngine: the NFP nester and its optimisation phases
+    engine-wrapper.js       NestEngine: chooses the raster or the polygon engine
+    leather-norm.js         LeatherNorm: the norm calculator
+  render/                   colors.js, renderer.js
+  export/                   consolidated-report.js, costing.js, export-manager.js
+  import/                   auto-size.js, dxf-import.js
+  ui/                       worksheet-manager.js, and app.js (App: the interface and orchestration)
+vendor/
+  clipper.js                Angus Johnson's Clipper 6.4.2, see THIRD-PARTY.md
+dist/
+  nestforge-pro.html        built output
+```
+
+## Adding to it
+
+The modules are plain scripts, not ES modules, and they share one global scope: a module can use
+anything declared by a module loaded before it. **The order of the script tags in `index.html` is
+the dependency order.**
+
+To add a module, create the file under `src/` and add a `<script src="src/...">` line to
+`index.html`, after everything it uses and before anything that uses it. The build picks it up with
+no other change.
+
+A script tag carrying `data-inline="append"` is merged by the build into the block above it rather
+than starting a new one. It is used only to keep Clipper beside the raster engine, the way the
+original single file had it.
 
 ## Licence
 
-All rights reserved. Readable here as a portfolio piece, not licensed for reuse or redistribution.
+© Utkarsh. All rights reserved. Readable here as a portfolio piece, not licensed for reuse or
+redistribution. Third-party components keep their own licences; see `THIRD-PARTY.md`.
