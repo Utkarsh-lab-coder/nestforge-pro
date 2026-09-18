@@ -2552,62 +2552,10 @@ const PolyNestEngine = {
      then does a cleanup sweep for the extras.
      ───────────────────────────────────────────────────────────────────── */
   // Multi-strategy public flowNest — try multiple lane configs, pick best.
+  // The 16-layout Cutting Flow search is shared with the other engine and
+  // runs its layouts in parallel. See src/nesting/flow-strategies.js.
   async flowNest(partDefs, settings, onProgress, isCancelled, onPlacement) {
-    // Strategy list — tries many rotation pairs to find the best
-    // packing angle. Each strategy is (flowDir, rotA, rotB).
-    // rotB = rotA + 180 keeps the within-lane alternation idea.
-    //
-    // Rotation angles tried: 0, 30, 45, 60, 90, 120, 135, 150 (and +180
-    // for each as the alternation partner). 8 base angles × 2 lane
-    // directions = 16 strategies, ~30s-2min depending on size.
-    const baseAngles = [0, 30, 45, 60, 90, 120, 135, 150];
-    const strategies = [];
-    for (const ang of baseAngles) {
-      strategies.push({
-        flowDir: 'horizontal', rotA: ang, rotB: (ang + 180) % 360,
-        label: 'H-lanes ' + ang + '°'
-      });
-      strategies.push({
-        flowDir: 'vertical', rotA: ang, rotB: (ang + 180) % 360,
-        label: 'V-lanes ' + ang + '°'
-      });
-    }
-    let bestResult = null;
-    let bestLabel = '';
-    for (let si = 0; si < strategies.length; si++) {
-      const strat = strategies[si];
-      if (isCancelled && isCancelled()) break;
-      const wrapProg = (pct, msg) => {
-        const ratio = (si + Math.min(pct, 1)) / strategies.length;
-        onProgress(ratio, `${strat.label} — ${msg}`);
-      };
-      const stratSettings = Object.assign({}, settings, {
-        flowDir: strat.flowDir,
-        _flowRotA: strat.rotA,
-        _flowRotB: strat.rotB,
-        _flowSwapAB: false
-      });
-      const result = await this._flowNestSingle(partDefs, stratSettings, wrapProg, isCancelled, () => {});
-      if (isCancelled && isCancelled()) break;
-      if (!result) continue;
-      const better = !bestResult
-        || result.placed > bestResult.placed
-        || (result.placed === bestResult.placed && result.usableH < bestResult.usableH);
-      if (better) {
-        bestResult = result;
-        bestLabel = strat.label;
-      }
-      console.log(`[CuttingFlow polygon strategy] ${strat.label}: placed=${result.placed}`);
-    }
-    if (bestResult) {
-      console.log(`[CuttingFlow polygon] winner: ${bestLabel} with ${bestResult.placed} placed`);
-      if (onPlacement && bestResult.placements) {
-        for (let i = 0; i < bestResult.placements.length; i++) {
-          try { onPlacement({ placement: bestResult.placements[i], totalPlaced: i + 1, sheetIdx: bestResult.placements[i].sheet || 0 }); } catch (_) {}
-        }
-      }
-    }
-    return bestResult;
+    return FlowStrategies.run(this, partDefs, settings, onProgress, isCancelled, onPlacement);
   },
 
   async _flowNestSingle(partDefs, settings, onProgress, isCancelled, onPlacement) {

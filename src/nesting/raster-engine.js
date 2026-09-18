@@ -46,88 +46,7 @@ const NestEngineRaster = {
     // If sheet is non-rectangular (hide) or has defects, build a mask of
     // cells that are FORBIDDEN for placement. Applied to every new grid
     // at start of runPass(), so canPlace() rejects those cells naturally.
-    let _obstacleMask = null;
-    if (settings.sheetOutline || (settings.defects && settings.defects.length)) {
-      _obstacleMask = new Uint8Array(GW * GH);
-
-      // 1. Mark cells OUTSIDE the sheet outline as forbidden.
-      if (settings.sheetOutline && settings.sheetOutline.length >= 3) {
-        const poly = settings.sheetOutline;  // already margin-shifted to usable-area coords
-        // Scanline rasterize: for each grid row, find x-intersections with polygon edges,
-        // then mark cells OUTSIDE the interior spans as forbidden.
-        for (let gy = 0; gy < GH; gy++) {
-          const yc = (gy + 0.5) / effRes;  // sheet-mm coordinate of cell center
-          const xs = [];
-          for (let i = 0; i < poly.length; i++) {
-            const [ax, ay] = poly[i];
-            const [bx, by] = poly[(i + 1) % poly.length];
-            if ((ay <= yc && by > yc) || (by <= yc && ay > yc)) {
-              const t = (yc - ay) / (by - ay);
-              xs.push(ax + t * (bx - ax));
-            }
-          }
-          xs.sort((a, b) => a - b);
-          // Mark all cells first as forbidden, then clear the inside spans
-          for (let gx = 0; gx < GW; gx++) _obstacleMask[gy * GW + gx] = 1;
-          for (let k = 0; k + 1 < xs.length; k += 2) {
-            const gxa = Math.max(0, Math.ceil(xs[k] * effRes));
-            const gxb = Math.min(GW - 1, Math.floor(xs[k + 1] * effRes));
-            for (let gx = gxa; gx <= gxb; gx++) _obstacleMask[gy * GW + gx] = 0;
-          }
-        }
-      }
-
-      // 2. Mark defect zones as forbidden. If defect has an irregular
-      //    shape polygon (realistic scar outline), rasterize it with
-      //    scanline. Otherwise fall back to circle.
-      if (settings.defects && settings.defects.length) {
-        for (const d of settings.defects) {
-          if (d.shape && d.shape.length >= 3) {
-            // Scanline-rasterize the polygon into the mask
-            let minY = Infinity, maxY = -Infinity;
-            for (const [, py] of d.shape) {
-              if (py < minY) minY = py;
-              if (py > maxY) maxY = py;
-            }
-            const gyStart = Math.max(0, Math.floor(minY * effRes));
-            const gyEnd = Math.min(GH - 1, Math.ceil(maxY * effRes));
-            for (let gy = gyStart; gy <= gyEnd; gy++) {
-              const yc = (gy + 0.5) / effRes;
-              const xs = [];
-              for (let i = 0; i < d.shape.length; i++) {
-                const [ax, ay] = d.shape[i];
-                const [bx, by] = d.shape[(i + 1) % d.shape.length];
-                if ((ay <= yc && by > yc) || (by <= yc && ay > yc)) {
-                  const t = (yc - ay) / (by - ay);
-                  xs.push(ax + t * (bx - ax));
-                }
-              }
-              xs.sort((a, b) => a - b);
-              for (let k = 0; k + 1 < xs.length; k += 2) {
-                const gxa = Math.max(0, Math.ceil(xs[k] * effRes));
-                const gxb = Math.min(GW - 1, Math.floor(xs[k + 1] * effRes));
-                for (let gx = gxa; gx <= gxb; gx++) _obstacleMask[gy * GW + gx] = 1;
-              }
-            }
-          } else {
-            // Circle fallback
-            const gcx = d.x * effRes, gcy = d.y * effRes;
-            const gr = d.r * effRes;
-            const gxa = Math.max(0, Math.floor(gcx - gr));
-            const gxb = Math.min(GW - 1, Math.ceil(gcx + gr));
-            const gya = Math.max(0, Math.floor(gcy - gr));
-            const gyb = Math.min(GH - 1, Math.ceil(gcy + gr));
-            const gr2 = gr * gr;
-            for (let gy = gya; gy <= gyb; gy++) {
-              for (let gx = gxa; gx <= gxb; gx++) {
-                const dx = gx + 0.5 - gcx, dy = gy + 0.5 - gcy;
-                if (dx*dx + dy*dy <= gr2) _obstacleMask[gy * GW + gx] = 1;
-              }
-            }
-          }
-        }
-      }
-    }
+    const _obstacleMask = this._buildObstacleMask(settings, GW, GH, effRes);
 
     onProgress(0, wasReduced
       ? `Auto-scaled res: ${(1/effRes).toFixed(1)}mm/cell  Grid: ${GW}×${GH}`
@@ -694,6 +613,93 @@ const NestEngineRaster = {
              usableW:usW, usableH:usH, effRes };
   },
 
+  // Cells a part may not use: outside a non-rectangular sheet (a hide) and on
+  // defects. Shared by nest() and _flowNestSingle(), which size their grids
+  // identically. Null for a plain rectangular sheet with no defects.
+  _buildObstacleMask(settings, GW, GH, effRes) {
+    if (!(settings.sheetOutline || (settings.defects && settings.defects.length))) return null;
+    const _obstacleMask = new Uint8Array(GW * GH);
+
+    // 1. Mark cells OUTSIDE the sheet outline as forbidden.
+    if (settings.sheetOutline && settings.sheetOutline.length >= 3) {
+      const poly = settings.sheetOutline;  // already margin-shifted to usable-area coords
+      // Scanline rasterize: for each grid row, find x-intersections with polygon edges,
+      // then mark cells OUTSIDE the interior spans as forbidden.
+      for (let gy = 0; gy < GH; gy++) {
+        const yc = (gy + 0.5) / effRes;  // sheet-mm coordinate of cell center
+        const xs = [];
+        for (let i = 0; i < poly.length; i++) {
+          const [ax, ay] = poly[i];
+          const [bx, by] = poly[(i + 1) % poly.length];
+          if ((ay <= yc && by > yc) || (by <= yc && ay > yc)) {
+            const t = (yc - ay) / (by - ay);
+            xs.push(ax + t * (bx - ax));
+          }
+        }
+        xs.sort((a, b) => a - b);
+        // Mark all cells first as forbidden, then clear the inside spans
+        for (let gx = 0; gx < GW; gx++) _obstacleMask[gy * GW + gx] = 1;
+        for (let k = 0; k + 1 < xs.length; k += 2) {
+          const gxa = Math.max(0, Math.ceil(xs[k] * effRes));
+          const gxb = Math.min(GW - 1, Math.floor(xs[k + 1] * effRes));
+          for (let gx = gxa; gx <= gxb; gx++) _obstacleMask[gy * GW + gx] = 0;
+        }
+      }
+    }
+
+    // 2. Mark defect zones as forbidden. If defect has an irregular
+    //    shape polygon (realistic scar outline), rasterize it with
+    //    scanline. Otherwise fall back to circle.
+    if (settings.defects && settings.defects.length) {
+      for (const d of settings.defects) {
+        if (d.shape && d.shape.length >= 3) {
+          // Scanline-rasterize the polygon into the mask
+          let minY = Infinity, maxY = -Infinity;
+          for (const [, py] of d.shape) {
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+          }
+          const gyStart = Math.max(0, Math.floor(minY * effRes));
+          const gyEnd = Math.min(GH - 1, Math.ceil(maxY * effRes));
+          for (let gy = gyStart; gy <= gyEnd; gy++) {
+            const yc = (gy + 0.5) / effRes;
+            const xs = [];
+            for (let i = 0; i < d.shape.length; i++) {
+              const [ax, ay] = d.shape[i];
+              const [bx, by] = d.shape[(i + 1) % d.shape.length];
+              if ((ay <= yc && by > yc) || (by <= yc && ay > yc)) {
+                const t = (yc - ay) / (by - ay);
+                xs.push(ax + t * (bx - ax));
+              }
+            }
+            xs.sort((a, b) => a - b);
+            for (let k = 0; k + 1 < xs.length; k += 2) {
+              const gxa = Math.max(0, Math.ceil(xs[k] * effRes));
+              const gxb = Math.min(GW - 1, Math.floor(xs[k + 1] * effRes));
+              for (let gx = gxa; gx <= gxb; gx++) _obstacleMask[gy * GW + gx] = 1;
+            }
+          }
+        } else {
+          // Circle fallback
+          const gcx = d.x * effRes, gcy = d.y * effRes;
+          const gr = d.r * effRes;
+          const gxa = Math.max(0, Math.floor(gcx - gr));
+          const gxb = Math.min(GW - 1, Math.ceil(gcx + gr));
+          const gya = Math.max(0, Math.floor(gcy - gr));
+          const gyb = Math.min(GH - 1, Math.ceil(gcy + gr));
+          const gr2 = gr * gr;
+          for (let gy = gya; gy <= gyb; gy++) {
+            for (let gx = gxa; gx <= gxb; gx++) {
+              const dx = gx + 0.5 - gcx, dy = gy + 0.5 - gcy;
+              if (dx*dx + dy*dy <= gr2) _obstacleMask[gy * GW + gx] = 1;
+            }
+          }
+        }
+      }
+    }
+    return _obstacleMask;
+  },
+
   getMirrors(m) {
     return m==='x'?[null,'x']
          :m==='y'?[null,'y']
@@ -923,81 +929,14 @@ const NestEngineRaster = {
   //   3. Horizontal lanes, parts on side (90° / 270°)  — try lying down
   //   4. Vertical lanes, parts upright (0° / 180°)     — try standing up
   // For each: also tries the swapped rotation pair (B-first instead of A).
+  // The 16-layout Cutting Flow search is shared with the other engine and
+  // runs its layouts in parallel. See src/nesting/flow-strategies.js.
   async flowNest(partDefs, settings, onProgress, isCancelled, onPlacement) {
-    // Strategies = { flowDir, swapAB, label } — each one is a full attempt.
-    // Strategy list — tries many rotation pairs to find the best
-    // packing angle. Each strategy is (flowDir, rotA, rotB).
-    // rotB = rotA + 180 keeps the within-lane alternation idea.
-    //
-    // Rotation angles tried: 0, 30, 45, 60, 90, 120, 135, 150 (and +180
-    // for each as the alternation partner). 8 base angles × 2 lane
-    // directions = 16 strategies, ~30s-2min depending on size.
-    const baseAngles = [0, 30, 45, 60, 90, 120, 135, 150];
-    const strategies = [];
-    for (const ang of baseAngles) {
-      strategies.push({
-        flowDir: 'horizontal', rotA: ang, rotB: (ang + 180) % 360,
-        label: 'H-lanes ' + ang + '°'
-      });
-      strategies.push({
-        flowDir: 'vertical', rotA: ang, rotB: (ang + 180) % 360,
-        label: 'V-lanes ' + ang + '°'
-      });
-    }
-
-    let bestResult = null;
-    let bestLabel = '';
-
-    for (let si = 0; si < strategies.length; si++) {
-      const strat = strategies[si];
-      if (isCancelled && isCancelled()) break;
-
-      // Wrap onProgress to show which strategy is running
-      const wrapProg = (pct, msg) => {
-        const ratio = (si + Math.min(pct, 1)) / strategies.length;
-        onProgress(ratio, `${strat.label} — ${msg}`);
-      };
-
-      // Build per-strategy settings — clone the input + override flowDir/swapAB
-      const stratSettings = Object.assign({}, settings, {
-        flowDir: strat.flowDir,
-        _flowRotA: strat.rotA,
-        _flowRotB: strat.rotB,
-        _flowSwapAB: false
-      });
-
-      // Use a "quiet" placement emitter so live preview doesn't flicker
-      // between strategy attempts. We'll re-emit only the winning result.
-      const result = await this._flowNestSingle(partDefs, stratSettings, wrapProg, isCancelled, () => {});
-
-      if (isCancelled && isCancelled()) break;
-      if (!result) continue;
-
-      // Compare: more placed wins, ties broken by tighter bbox
-      const better = !bestResult
-        || result.placed > bestResult.placed
-        || (result.placed === bestResult.placed && result.usableH < bestResult.usableH);
-      if (better) {
-        bestResult = result;
-        bestLabel = strat.label;
-      }
-      console.log(`[CuttingFlow strategy] ${strat.label}: placed=${result.placed}`);
-    }
-
-    if (bestResult) {
-      console.log(`[CuttingFlow] winner: ${bestLabel} with ${bestResult.placed} placed`);
-      // Emit all winning placements via onPlacement callback for UI
-      if (onPlacement && bestResult.placements) {
-        for (let i = 0; i < bestResult.placements.length; i++) {
-          try { onPlacement({ placement: bestResult.placements[i], totalPlaced: i + 1, sheetIdx: bestResult.placements[i].sheet || 0 }); } catch (_) {}
-        }
-      }
-    }
-    return bestResult;
+    return FlowStrategies.run(this, partDefs, settings, onProgress, isCancelled, onPlacement);
   },
 
   // SINGLE-STRATEGY flowNest — actually runs one specific lane direction.
-  // The public flowNest() below tries multiple strategies and picks the best.
+  // flowNest() above hands all 16 layouts to FlowStrategies.run().
   async _flowNestSingle(partDefs, settings, onProgress, isCancelled, onPlacement) {
     const _emit = onPlacement || (() => {});
     const { sheetW, sheetH, margin, gap, resolution, mirrorMode,
@@ -1011,6 +950,10 @@ const NestEngineRaster = {
     const effRes = resLimit < resolution ? Math.max(0.5, resLimit) : resolution;
     const GW = Math.ceil(usW * effRes), GH = Math.ceil(usH * effRes);
     const gapC = Math.ceil(gap * effRes);
+    // Hide outline and defects. This call was missing: the grid code below
+    // was copied from nest() without the mask it depends on, so every raster
+    // Cutting Flow run threw "_obstacleMask is not defined".
+    const _obstacleMask = this._buildObstacleMask(settings, GW, GH, effRes);
     const mirrors = this.getMirrors(mirrorMode);
 
     // Use caller-provided rotation pair if specified (multi-strategy
