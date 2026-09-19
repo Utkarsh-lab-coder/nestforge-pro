@@ -2,11 +2,17 @@
  * NestForge Pro — Cutting Flow lane search, shared by both engines
  *
  * The lane direction the user picks is a promise: "Vertical lanes (90° ↔
- * 270°)" means vertical lanes with parts alternating 90° and 270°, exactly
- * as the Lane Preview shows. That one layout is what runs. The "Auto"
- * direction keeps the wider search: sixteen lane layouts, eight angles
- * across horizontal and vertical lanes, keeping the fullest (most parts
- * placed, then the smaller used height, then whichever comes first).
+ * 270°)" means vertical lanes with parts at 90° and 270°, exactly as the
+ * Lane Preview shows. Within that promise there are still several ways to
+ * sequence the lanes, and which one packs best depends on the shape:
+ * alternate the two rotations along a row or give whole rows one rotation,
+ * let a part tuck into the cavity of the one before it or not, start every
+ * other row half a part in so cups interlock. So a run tries every lane
+ * sequence for the chosen direction (28 layouts, all of them lanes, all
+ * with the promised rotations) and keeps the fullest: most complete sets,
+ * then most parts placed, then the smaller used height, then whichever
+ * comes first. The "Auto" direction widens this to eight angles across
+ * horizontal and vertical lanes, with the six most distinct sequences each.
  *
  * Multi-sheet: the flow engine lays out one sheet. With "more sheets if
  * parts overflow" on, run() lays out sheet after sheet, each getting what
@@ -39,18 +45,54 @@ const FlowStrategies = (() => {
     STRATEGIES.push({ flowDir: 'vertical',   rotA: ang, rotB: (ang + 180) % 360, label: 'V-lanes ' + ang + '°' });
   }
 
-  // The layouts a run tries. A chosen direction is followed exactly: the
-  // one layout the Lane Preview promises (horizontal 0° ↔ 180°, vertical
-  // 90° ↔ 270°). 'auto' tries all sixteen.
+  // Lane sequences: how the two rotations A (rotA) and B (rotB) are dealt
+  // out along and across the rows, whether the cursor advances a full part
+  // or half (so the next part can tuck into the cavity of the one before),
+  // and whether odd rows start half a part in. The first entry is the
+  // original layout, so an exact tie keeps the old behaviour.
+  const SEQS = [
+    { seq: 'alt-flip',  name: 'A/B alternating, rows staggered' },
+    { seq: 'alt',       name: 'A/B alternating' },
+    { seq: 'rows',      name: 'rows of A then rows of B' },
+    { seq: 'rows-flip', name: 'rows of B then rows of A' },
+    { seq: 'same-A',    name: 'all A' },
+    { seq: 'same-B',    name: 'all B' },
+    { seq: 'tight',     name: 'tightest of A/B at each place' },
+  ];
+  const SEQUENCES = [];
+  for (const q of SEQS) {
+    for (const advance of ['full', 'half']) {
+      for (const offset of [0, 0.5]) {
+        SEQUENCES.push({ seq: q.seq, advance, offset,
+          name: q.name + (advance === 'half' ? ', tucked' : '') + (offset ? ', offset rows' : '') });
+      }
+    }
+  }
+  // For the sixteen-angle Auto search: the six most distinct sequences.
+  const AUTO_SEQUENCES = SEQUENCES.filter(q => q.offset === 0 && ['alt-flip', 'rows', 'tight'].includes(q.seq));
+
+  const withSeq = (dir, q) => Object.assign({}, dir, q, {
+    label: dir.label + ' · ' + q.name.replace(/\bA\b/g, dir.rotA + '°').replace(/\bB\b/g, dir.rotB + '°'),
+  });
+
+  // The layouts a run tries. A chosen direction is followed exactly (the
+  // one the Lane Preview promises: horizontal 0° ↔ 180°, vertical 90° ↔
+  // 270°), in every lane sequence. 'auto' tries all sixteen directions.
   function strategiesFor(settings) {
-    if (settings.flowDir === 'auto') return STRATEGIES.slice();
+    if (settings.flowDir === 'auto') {
+      const out = [];
+      for (const dir of STRATEGIES) for (const q of AUTO_SEQUENCES) out.push(withSeq(dir, q));
+      return out;
+    }
     const dir = settings.flowDir === 'vertical' ? 'vertical' : 'horizontal';
     const rotA = dir === 'vertical' ? 90 : 0;
-    return STRATEGIES.filter(s => s.flowDir === dir && s.rotA === rotA);
+    const base = STRATEGIES.find(s => s.flowDir === dir && s.rotA === rotA);
+    return SEQUENCES.map(q => withSeq(base, q));
   }
 
   const settingsFor = (settings, s) => Object.assign({}, settings, {
     flowDir: s.flowDir, _flowRotA: s.rotA, _flowRotB: s.rotB, _flowSwapAB: false,
+    _flowSeq: s.seq || 'alt-flip', _flowAdvance: s.advance || 'full', _flowOffset: s.offset || 0,
   });
 
   // The original comparison: more parts placed wins, then the smaller used
@@ -118,7 +160,10 @@ const FlowStrategies = (() => {
 
     const { best, bestLabel } = pickBest(strategies, results, tag);
     console.log(`[CuttingFlow${tag}] ${strategies.length} layout(s) ${how} in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-    if (best) console.log(`[CuttingFlow${tag}] ${strategies.length > 1 ? 'winner: ' : 'layout: '}${bestLabel} with ${best.placed} placed`);
+    if (best) {
+      best.flowLabel = bestLabel;
+      console.log(`[CuttingFlow${tag}] winner: ${bestLabel} with ${best.placed} placed`);
+    }
     return best;
   }
 
@@ -175,8 +220,9 @@ const FlowStrategies = (() => {
       usableW: first ? first.usableW : settings.sheetW - 2 * settings.margin,
       usableH: first ? first.usableH : settings.sheetH - 2 * settings.margin,
       effRes: first ? first.effRes : 'polygon', cuttingFlow: true,
+      flowLabel: first ? first.flowLabel : undefined,
     };
   }
 
-  return { run, STRATEGIES, strategiesFor };
+  return { run, STRATEGIES, SEQUENCES, strategiesFor };
 })();

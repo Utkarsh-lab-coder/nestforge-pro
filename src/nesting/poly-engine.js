@@ -1505,6 +1505,9 @@ const PolyNestEngine = {
       sheetCount: sheetsList.length,
       usableW: usW, usableH: usH, effRes: 'polygon'
     };
+    // Fill mode inflates the queue to saturate the sheet; what is left of that
+    // queue is not "unplaced", the sheet is simply full.
+    if (fillSheet && !derivedSets && !settings._autoExpandQueueCap) out.unplaced = 0;
     if (derivedSets) {
       // What the user asked for and what they got: N of each part. Unplaced
       // is the shortfall against the request (an extra of a part covers a
@@ -2927,6 +2930,34 @@ const PolyNestEngine = {
       if (setsFirst && !capsLifted && allCapsReached()) liftCaps();
     };
 
+    // Lane sequence (FlowStrategies tries every combination for the chosen
+    // direction and keeps the fullest layout):
+    //   _flowSeq      which rotation goes where. 'alt-flip' = A B A B / B A B A
+    //                 (the original), 'alt' = A B A B in every row, 'rows' =
+    //                 rows of A then rows of B, 'rows-flip', 'same-A', 'same-B',
+    //                 'tight' = both tried at every place, the leftmost wins.
+    //   _flowAdvance  'full' = the next part starts past the previous bbox
+    //                 (the original); 'half' = half a part back, so it can tuck
+    //                 into the previous part's cavity (the skyline keeps it
+    //                 collision-free and the row rule keeps it in the row).
+    //   _flowOffset   0.5 = odd rows start half a part in (brick pattern).
+    const flowSeq = settings._flowSeq || 'alt-flip';
+    const halfAdvance = settings._flowAdvance === 'half';
+    const rowOffset = settings._flowOffset || 0;
+    const rotFor = (rowNum, posInRow) => {
+      switch (flowSeq) {
+        case 'alt':       return posInRow % 2 === 0 ? 'A' : 'B';
+        case 'rows':      return rowNum % 2 === 0 ? 'A' : 'B';
+        case 'rows-flip': return rowNum % 2 === 0 ? 'B' : 'A';
+        case 'same-A':    return 'A';
+        case 'same-B':    return 'B';
+        case 'tight':     return 'AB';
+        default:          return (rowNum + posInRow) % 2 === 0 ? 'A' : 'B';
+      }
+    };
+    const firstVar = vcA.get(cycle[0].id)[0];
+    const offsetX = rowOffset ? Math.round(rowOffset * firstVar.bbox.w) : 0;
+
     // ────── PHASE 1: ORDERED ROW FILL ──────
     let rowY = 0;
     let rowNum = 0;
@@ -2934,7 +2965,7 @@ const PolyNestEngine = {
     phase1: while (placedCount < maxTotal) {
       if (isCancelled && isCancelled()) break;
 
-      let curX = 0, posInRow = 0, rowPlaced = 0;
+      let curX = (rowNum % 2 === 1) ? offsetX : 0, posInRow = 0, rowPlaced = 0;
       let rowMaxBottomY = rowY;  // track the lowest point of parts in this row
 
       while (placedCount < maxTotal) {
@@ -2948,7 +2979,7 @@ const PolyNestEngine = {
           lastYield = performance.now();
         }
 
-        const useA = (rowNum + posInRow) % 2 === 0;
+        const which = rotFor(rowNum, posInRow);
         const partIdx = posInRow % partDefs.length;
         const part = cycle[partIdx];
 
@@ -2958,8 +2989,16 @@ const PolyNestEngine = {
           continue;
         }
 
-        const variants = (useA ? vcA : vcB).get(part.id);
-        const pl = this.placeInRowStrict(variants, skyline, usW, usH, rowY, curX);
+        let variants, pl;
+        if (which === 'AB') {
+          const va = vcA.get(part.id), vb = vcB.get(part.id);
+          const pa = this.placeInRowStrict(va, skyline, usW, usH, rowY, curX);
+          const pb = this.placeInRowStrict(vb, skyline, usW, usH, rowY, curX);
+          if (pa && (!pb || pa.x <= pb.x)) { variants = va; pl = pa; } else { variants = vb; pl = pb; }
+        } else {
+          variants = (which === 'A' ? vcA : vcB).get(part.id);
+          pl = this.placeInRowStrict(variants, skyline, usW, usH, rowY, curX);
+        }
 
         if (pl === null) {
           // This rotation/part didn't fit at current cursor — try next
@@ -2970,7 +3009,7 @@ const PolyNestEngine = {
 
         commitPlacement(pl, variants, part);
         const v = variants[pl.vi];
-        curX = pl.x + v.bbox.w;  // advance cursor past right edge
+        curX = pl.x + (halfAdvance ? Math.max(1, Math.floor(v.bbox.w * 0.5)) : v.bbox.w);
         const placedTop = pl.y + v.bbox.h;
         if (placedTop > rowMaxBottomY) rowMaxBottomY = placedTop;
 
@@ -3043,6 +3082,7 @@ const PolyNestEngine = {
       unplaced: Math.max(0, maxTotal - placedCount),
       sheetCount: 1, usableW: usW, usableH: usH, effRes: 'polygon', cuttingFlow: true
     };
+    if (fillSheet && !setsFirst && !settings._autoExpandQueueCap) out.unplaced = 0;   // the sheet is full, nothing is missing
     if (setsFirst) {
       const byId = new Map(partDefs.map(p => [p.id, 0]));
       for (const pl of placed) byId.set(pl.partId, (byId.get(pl.partId) || 0) + 1);

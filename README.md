@@ -25,9 +25,11 @@ over to the next sheet.
 
 **Cutting Flow.** Lays pieces out in lanes for a clean CNC cutting path. The lane direction chosen
 is followed exactly, horizontal lanes with pieces at 0° and 180° or vertical lanes at 90° and 270°,
-and the lane layout is always the result: it is never swapped for a tighter free-form nest. The
-"Auto" direction tries sixteen lane layouts, eight angles across horizontal and vertical lanes, and
-keeps whichever places the most pieces.
+and the lane layout is always the result: it is never swapped for a tighter free-form nest. Within
+that direction it tries every way of sequencing the lanes (the two rotations alternating along a
+row or by whole rows, parts tucked into the cavity of the one before or not, odd rows offset by
+half a part), 28 layouts, and keeps the fullest; the status line names the winner. The "Auto"
+direction widens the search to eight angles across horizontal and vertical lanes.
 
 **Measure tool.** A ruler on the canvas, in millimetres. Two clicks give a distance, snapping to
 part corners and edges and to the sheet; a click inside one part and then another gives the

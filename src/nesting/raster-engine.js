@@ -671,6 +671,7 @@ const NestEngineRaster = {
              unplaced: totalUnplaced,
              sheetCount: sheetsList.length,
              usableW:usW, usableH:usH, effRes };
+    if (fillSheet && !derivedSets && !settings._autoExpandQueueCap) out.unplaced = 0;   // fill leftovers are not missing parts
     if (derivedSets) {
       out.sets = { requested: nSetsWanted, complete: countSets(allPl), partsPerSet: partDefs.length,
                    perPart: placedPerPart(allPl) };
@@ -1127,8 +1128,26 @@ const NestEngineRaster = {
       return true;
     };
 
+    // Lane sequence knobs, as in the polygon engine's _flowNestSingle. The
+    // raster engine's own original is 'tight' with a half advance.
+    const flowSeq = settings._flowSeq || 'tight';
+    const halfAdvance = settings._flowAdvance ? settings._flowAdvance === 'half' : true;
+    const rowOffset = settings._flowOffset || 0;
+    const rotFor = (rowNum, posInRow) => {
+      switch (flowSeq) {
+        case 'alt':       return posInRow % 2 === 0 ? 'A' : 'B';
+        case 'alt-flip':  return (rowNum + posInRow) % 2 === 0 ? 'A' : 'B';
+        case 'rows':      return rowNum % 2 === 0 ? 'A' : 'B';
+        case 'rows-flip': return rowNum % 2 === 0 ? 'B' : 'A';
+        case 'same-A':    return 'A';
+        case 'same-B':    return 'B';
+        default:          return 'AB';
+      }
+    };
+    const offsetGX = rowOffset ? Math.round(rowOffset * vcA.get(cycle[0].id)[0].w) : 0;
+
     rowLoop: while (true) {
-      let curGX = 0, posInRow = 0, rowPlaced = 0;
+      let curGX = (rowNum % 2 === 1) ? offsetGX : 0, posInRow = 0, rowPlaced = 0;
 
       while (true) {
         if (isCancelled && isCancelled()) break rowLoop;
@@ -1161,10 +1180,11 @@ const NestEngineRaster = {
           continue;
         }
 
+        const which = rotFor(rowNum, posInRow);
         const variantsA = vcA.get(part.id);
         const variantsB = vcB.get(part.id);
-        const plA = placeFromX(variantsA, curGX);
-        const plB = placeFromX(variantsB, curGX);
+        const plA = which === 'B' ? null : placeFromX(variantsA, curGX);
+        const plB = which === 'A' ? null : placeFromX(variantsB, curGX);
 
         // Pick the leftmost (tighter) placement; if both same gx, prefer A.
         // null means that variant set couldn't fit anywhere.
@@ -1210,7 +1230,7 @@ const NestEngineRaster = {
         // forward from there and find the leftmost cavity-respecting
         // position via canPlace() collision check. Same quality
         // guarantees, much tighter horizontal packing.
-        curGX = pl.gx + Math.max(1, Math.floor(v.w * 0.5));
+        curGX = pl.gx + (halfAdvance ? Math.max(1, Math.floor(v.w * 0.5)) : v.w);
         posInRow++;
         rowPlaced++;
         placed++;
@@ -1229,6 +1249,7 @@ const NestEngineRaster = {
     const out = { placements:allPl, sheets, placed,
              unplaced: Math.max(0, maxTotal - placed),
              sheetCount: 1, usableW:usW, usableH:usH, effRes, cuttingFlow:true };
+    if (fillSheet && !setsFirst && !settings._autoExpandQueueCap) out.unplaced = 0;   // the sheet is full, nothing is missing
     if (setsFirst) {
       const byId = new Map(partDefs.map(p => [p.id, 0]));
       for (const pl of allPl) byId.set(pl.partId, (byId.get(pl.partId) || 0) + 1);

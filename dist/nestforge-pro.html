@@ -4806,6 +4806,7 @@ const NestEngineRaster = {
              unplaced: totalUnplaced,
              sheetCount: sheetsList.length,
              usableW:usW, usableH:usH, effRes };
+    if (fillSheet && !derivedSets && !settings._autoExpandQueueCap) out.unplaced = 0;   // fill leftovers are not missing parts
     if (derivedSets) {
       out.sets = { requested: nSetsWanted, complete: countSets(allPl), partsPerSet: partDefs.length,
                    perPart: placedPerPart(allPl) };
@@ -5262,8 +5263,26 @@ const NestEngineRaster = {
       return true;
     };
 
+    // Lane sequence knobs, as in the polygon engine's _flowNestSingle. The
+    // raster engine's own original is 'tight' with a half advance.
+    const flowSeq = settings._flowSeq || 'tight';
+    const halfAdvance = settings._flowAdvance ? settings._flowAdvance === 'half' : true;
+    const rowOffset = settings._flowOffset || 0;
+    const rotFor = (rowNum, posInRow) => {
+      switch (flowSeq) {
+        case 'alt':       return posInRow % 2 === 0 ? 'A' : 'B';
+        case 'alt-flip':  return (rowNum + posInRow) % 2 === 0 ? 'A' : 'B';
+        case 'rows':      return rowNum % 2 === 0 ? 'A' : 'B';
+        case 'rows-flip': return rowNum % 2 === 0 ? 'B' : 'A';
+        case 'same-A':    return 'A';
+        case 'same-B':    return 'B';
+        default:          return 'AB';
+      }
+    };
+    const offsetGX = rowOffset ? Math.round(rowOffset * vcA.get(cycle[0].id)[0].w) : 0;
+
     rowLoop: while (true) {
-      let curGX = 0, posInRow = 0, rowPlaced = 0;
+      let curGX = (rowNum % 2 === 1) ? offsetGX : 0, posInRow = 0, rowPlaced = 0;
 
       while (true) {
         if (isCancelled && isCancelled()) break rowLoop;
@@ -5296,10 +5315,11 @@ const NestEngineRaster = {
           continue;
         }
 
+        const which = rotFor(rowNum, posInRow);
         const variantsA = vcA.get(part.id);
         const variantsB = vcB.get(part.id);
-        const plA = placeFromX(variantsA, curGX);
-        const plB = placeFromX(variantsB, curGX);
+        const plA = which === 'B' ? null : placeFromX(variantsA, curGX);
+        const plB = which === 'A' ? null : placeFromX(variantsB, curGX);
 
         // Pick the leftmost (tighter) placement; if both same gx, prefer A.
         // null means that variant set couldn't fit anywhere.
@@ -5345,7 +5365,7 @@ const NestEngineRaster = {
         // forward from there and find the leftmost cavity-respecting
         // position via canPlace() collision check. Same quality
         // guarantees, much tighter horizontal packing.
-        curGX = pl.gx + Math.max(1, Math.floor(v.w * 0.5));
+        curGX = pl.gx + (halfAdvance ? Math.max(1, Math.floor(v.w * 0.5)) : v.w);
         posInRow++;
         rowPlaced++;
         placed++;
@@ -5364,6 +5384,7 @@ const NestEngineRaster = {
     const out = { placements:allPl, sheets, placed,
              unplaced: Math.max(0, maxTotal - placed),
              sheetCount: 1, usableW:usW, usableH:usH, effRes, cuttingFlow:true };
+    if (fillSheet && !setsFirst && !settings._autoExpandQueueCap) out.unplaced = 0;   // the sheet is full, nothing is missing
     if (setsFirst) {
       const byId = new Map(partDefs.map(p => [p.id, 0]));
       for (const pl of allPl) byId.set(pl.partId, (byId.get(pl.partId) || 0) + 1);
@@ -15070,6 +15091,9 @@ const PolyNestEngine = {
       sheetCount: sheetsList.length,
       usableW: usW, usableH: usH, effRes: 'polygon'
     };
+    // Fill mode inflates the queue to saturate the sheet; what is left of that
+    // queue is not "unplaced", the sheet is simply full.
+    if (fillSheet && !derivedSets && !settings._autoExpandQueueCap) out.unplaced = 0;
     if (derivedSets) {
       // What the user asked for and what they got: N of each part. Unplaced
       // is the shortfall against the request (an extra of a part covers a
@@ -16492,6 +16516,34 @@ const PolyNestEngine = {
       if (setsFirst && !capsLifted && allCapsReached()) liftCaps();
     };
 
+    // Lane sequence (FlowStrategies tries every combination for the chosen
+    // direction and keeps the fullest layout):
+    //   _flowSeq      which rotation goes where. 'alt-flip' = A B A B / B A B A
+    //                 (the original), 'alt' = A B A B in every row, 'rows' =
+    //                 rows of A then rows of B, 'rows-flip', 'same-A', 'same-B',
+    //                 'tight' = both tried at every place, the leftmost wins.
+    //   _flowAdvance  'full' = the next part starts past the previous bbox
+    //                 (the original); 'half' = half a part back, so it can tuck
+    //                 into the previous part's cavity (the skyline keeps it
+    //                 collision-free and the row rule keeps it in the row).
+    //   _flowOffset   0.5 = odd rows start half a part in (brick pattern).
+    const flowSeq = settings._flowSeq || 'alt-flip';
+    const halfAdvance = settings._flowAdvance === 'half';
+    const rowOffset = settings._flowOffset || 0;
+    const rotFor = (rowNum, posInRow) => {
+      switch (flowSeq) {
+        case 'alt':       return posInRow % 2 === 0 ? 'A' : 'B';
+        case 'rows':      return rowNum % 2 === 0 ? 'A' : 'B';
+        case 'rows-flip': return rowNum % 2 === 0 ? 'B' : 'A';
+        case 'same-A':    return 'A';
+        case 'same-B':    return 'B';
+        case 'tight':     return 'AB';
+        default:          return (rowNum + posInRow) % 2 === 0 ? 'A' : 'B';
+      }
+    };
+    const firstVar = vcA.get(cycle[0].id)[0];
+    const offsetX = rowOffset ? Math.round(rowOffset * firstVar.bbox.w) : 0;
+
     // ────── PHASE 1: ORDERED ROW FILL ──────
     let rowY = 0;
     let rowNum = 0;
@@ -16499,7 +16551,7 @@ const PolyNestEngine = {
     phase1: while (placedCount < maxTotal) {
       if (isCancelled && isCancelled()) break;
 
-      let curX = 0, posInRow = 0, rowPlaced = 0;
+      let curX = (rowNum % 2 === 1) ? offsetX : 0, posInRow = 0, rowPlaced = 0;
       let rowMaxBottomY = rowY;  // track the lowest point of parts in this row
 
       while (placedCount < maxTotal) {
@@ -16513,7 +16565,7 @@ const PolyNestEngine = {
           lastYield = performance.now();
         }
 
-        const useA = (rowNum + posInRow) % 2 === 0;
+        const which = rotFor(rowNum, posInRow);
         const partIdx = posInRow % partDefs.length;
         const part = cycle[partIdx];
 
@@ -16523,8 +16575,16 @@ const PolyNestEngine = {
           continue;
         }
 
-        const variants = (useA ? vcA : vcB).get(part.id);
-        const pl = this.placeInRowStrict(variants, skyline, usW, usH, rowY, curX);
+        let variants, pl;
+        if (which === 'AB') {
+          const va = vcA.get(part.id), vb = vcB.get(part.id);
+          const pa = this.placeInRowStrict(va, skyline, usW, usH, rowY, curX);
+          const pb = this.placeInRowStrict(vb, skyline, usW, usH, rowY, curX);
+          if (pa && (!pb || pa.x <= pb.x)) { variants = va; pl = pa; } else { variants = vb; pl = pb; }
+        } else {
+          variants = (which === 'A' ? vcA : vcB).get(part.id);
+          pl = this.placeInRowStrict(variants, skyline, usW, usH, rowY, curX);
+        }
 
         if (pl === null) {
           // This rotation/part didn't fit at current cursor — try next
@@ -16535,7 +16595,7 @@ const PolyNestEngine = {
 
         commitPlacement(pl, variants, part);
         const v = variants[pl.vi];
-        curX = pl.x + v.bbox.w;  // advance cursor past right edge
+        curX = pl.x + (halfAdvance ? Math.max(1, Math.floor(v.bbox.w * 0.5)) : v.bbox.w);
         const placedTop = pl.y + v.bbox.h;
         if (placedTop > rowMaxBottomY) rowMaxBottomY = placedTop;
 
@@ -16608,6 +16668,7 @@ const PolyNestEngine = {
       unplaced: Math.max(0, maxTotal - placedCount),
       sheetCount: 1, usableW: usW, usableH: usH, effRes: 'polygon', cuttingFlow: true
     };
+    if (fillSheet && !setsFirst && !settings._autoExpandQueueCap) out.unplaced = 0;   // the sheet is full, nothing is missing
     if (setsFirst) {
       const byId = new Map(partDefs.map(p => [p.id, 0]));
       for (const pl of placed) byId.set(pl.partId, (byId.get(pl.partId) || 0) + 1);
@@ -16849,11 +16910,17 @@ self.postMessage({ type: 'ready',
  * NestForge Pro — Cutting Flow lane search, shared by both engines
  *
  * The lane direction the user picks is a promise: "Vertical lanes (90° ↔
- * 270°)" means vertical lanes with parts alternating 90° and 270°, exactly
- * as the Lane Preview shows. That one layout is what runs. The "Auto"
- * direction keeps the wider search: sixteen lane layouts, eight angles
- * across horizontal and vertical lanes, keeping the fullest (most parts
- * placed, then the smaller used height, then whichever comes first).
+ * 270°)" means vertical lanes with parts at 90° and 270°, exactly as the
+ * Lane Preview shows. Within that promise there are still several ways to
+ * sequence the lanes, and which one packs best depends on the shape:
+ * alternate the two rotations along a row or give whole rows one rotation,
+ * let a part tuck into the cavity of the one before it or not, start every
+ * other row half a part in so cups interlock. So a run tries every lane
+ * sequence for the chosen direction (28 layouts, all of them lanes, all
+ * with the promised rotations) and keeps the fullest: most complete sets,
+ * then most parts placed, then the smaller used height, then whichever
+ * comes first. The "Auto" direction widens this to eight angles across
+ * horizontal and vertical lanes, with the six most distinct sequences each.
  *
  * Multi-sheet: the flow engine lays out one sheet. With "more sheets if
  * parts overflow" on, run() lays out sheet after sheet, each getting what
@@ -16886,18 +16953,54 @@ const FlowStrategies = (() => {
     STRATEGIES.push({ flowDir: 'vertical',   rotA: ang, rotB: (ang + 180) % 360, label: 'V-lanes ' + ang + '°' });
   }
 
-  // The layouts a run tries. A chosen direction is followed exactly: the
-  // one layout the Lane Preview promises (horizontal 0° ↔ 180°, vertical
-  // 90° ↔ 270°). 'auto' tries all sixteen.
+  // Lane sequences: how the two rotations A (rotA) and B (rotB) are dealt
+  // out along and across the rows, whether the cursor advances a full part
+  // or half (so the next part can tuck into the cavity of the one before),
+  // and whether odd rows start half a part in. The first entry is the
+  // original layout, so an exact tie keeps the old behaviour.
+  const SEQS = [
+    { seq: 'alt-flip',  name: 'A/B alternating, rows staggered' },
+    { seq: 'alt',       name: 'A/B alternating' },
+    { seq: 'rows',      name: 'rows of A then rows of B' },
+    { seq: 'rows-flip', name: 'rows of B then rows of A' },
+    { seq: 'same-A',    name: 'all A' },
+    { seq: 'same-B',    name: 'all B' },
+    { seq: 'tight',     name: 'tightest of A/B at each place' },
+  ];
+  const SEQUENCES = [];
+  for (const q of SEQS) {
+    for (const advance of ['full', 'half']) {
+      for (const offset of [0, 0.5]) {
+        SEQUENCES.push({ seq: q.seq, advance, offset,
+          name: q.name + (advance === 'half' ? ', tucked' : '') + (offset ? ', offset rows' : '') });
+      }
+    }
+  }
+  // For the sixteen-angle Auto search: the six most distinct sequences.
+  const AUTO_SEQUENCES = SEQUENCES.filter(q => q.offset === 0 && ['alt-flip', 'rows', 'tight'].includes(q.seq));
+
+  const withSeq = (dir, q) => Object.assign({}, dir, q, {
+    label: dir.label + ' · ' + q.name.replace(/\bA\b/g, dir.rotA + '°').replace(/\bB\b/g, dir.rotB + '°'),
+  });
+
+  // The layouts a run tries. A chosen direction is followed exactly (the
+  // one the Lane Preview promises: horizontal 0° ↔ 180°, vertical 90° ↔
+  // 270°), in every lane sequence. 'auto' tries all sixteen directions.
   function strategiesFor(settings) {
-    if (settings.flowDir === 'auto') return STRATEGIES.slice();
+    if (settings.flowDir === 'auto') {
+      const out = [];
+      for (const dir of STRATEGIES) for (const q of AUTO_SEQUENCES) out.push(withSeq(dir, q));
+      return out;
+    }
     const dir = settings.flowDir === 'vertical' ? 'vertical' : 'horizontal';
     const rotA = dir === 'vertical' ? 90 : 0;
-    return STRATEGIES.filter(s => s.flowDir === dir && s.rotA === rotA);
+    const base = STRATEGIES.find(s => s.flowDir === dir && s.rotA === rotA);
+    return SEQUENCES.map(q => withSeq(base, q));
   }
 
   const settingsFor = (settings, s) => Object.assign({}, settings, {
     flowDir: s.flowDir, _flowRotA: s.rotA, _flowRotB: s.rotB, _flowSwapAB: false,
+    _flowSeq: s.seq || 'alt-flip', _flowAdvance: s.advance || 'full', _flowOffset: s.offset || 0,
   });
 
   // The original comparison: more parts placed wins, then the smaller used
@@ -16965,7 +17068,10 @@ const FlowStrategies = (() => {
 
     const { best, bestLabel } = pickBest(strategies, results, tag);
     console.log(`[CuttingFlow${tag}] ${strategies.length} layout(s) ${how} in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-    if (best) console.log(`[CuttingFlow${tag}] ${strategies.length > 1 ? 'winner: ' : 'layout: '}${bestLabel} with ${best.placed} placed`);
+    if (best) {
+      best.flowLabel = bestLabel;
+      console.log(`[CuttingFlow${tag}] winner: ${bestLabel} with ${best.placed} placed`);
+    }
     return best;
   }
 
@@ -17022,10 +17128,11 @@ const FlowStrategies = (() => {
       usableW: first ? first.usableW : settings.sheetW - 2 * settings.margin,
       usableH: first ? first.usableH : settings.sheetH - 2 * settings.margin,
       effRes: first ? first.effRes : 'polygon', cuttingFlow: true,
+      flowLabel: first ? first.flowLabel : undefined,
     };
   }
 
-  return { run, STRATEGIES, strategiesFor };
+  return { run, STRATEGIES, SEQUENCES, strategiesFor };
 })();
 </script>
 <script>
@@ -28520,7 +28627,7 @@ const App = {
         // without re-nesting). Only requires polygon engine.
         const imp = document.getElementById('btn-improve');
         if (imp) imp.disabled = (result.placed === 0) || window.__useRasterEngine;
-        const flowTag = result.cuttingFlow ? ' ✂ FLOW' : '';
+        const flowTag = result.cuttingFlow ? ' ✂ FLOW' + (result.flowLabel ? ' (' + result.flowLabel + ')' : '') : '';
         const engineTag = window.__useRasterEngine ? ' [raster]' : ' [polygon-NFP]';
         const grewTag = (settings.sheetH !== origH)
           ? `  •  Auto-fit H: ${origH}→${settings.sheetH}mm`

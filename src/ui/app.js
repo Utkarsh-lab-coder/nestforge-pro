@@ -3305,7 +3305,7 @@ const App = {
         // without re-nesting). Only requires polygon engine.
         const imp = document.getElementById('btn-improve');
         if (imp) imp.disabled = (result.placed === 0) || window.__useRasterEngine;
-        const flowTag = result.cuttingFlow ? ' ✂ FLOW' : '';
+        const flowTag = result.cuttingFlow ? ' ✂ FLOW' + (result.flowLabel ? ' (' + result.flowLabel + ')' : '') : '';
         const engineTag = window.__useRasterEngine ? ' [raster]' : ' [polygon-NFP]';
         const grewTag = (settings.sheetH !== origH)
           ? `  •  Auto-fit H: ${origH}→${settings.sheetH}mm`
