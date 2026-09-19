@@ -32,6 +32,12 @@ half a part), 28 layouts, and keeps the fullest; the status line names the winne
 direction widens the search to eight angles across horizontal and vertical lanes. On a hide the
 lanes stay on the hide and off the defects, and follow the hide's edge.
 
+**When parts overflow.** Either the sheet grows or more sheets are made. "Grow the sheet when
+parts overflow" grows the length (height, width fixed), the width (height fixed) or both in
+proportion, then trims back to what was used; switched off, the sheet stays exactly as set and
+the parts that did not fit are reported. "More sheets if parts overflow" spills whole sets onto
+sheet 2, 3… of the same size and takes precedence over growing. A hide never grows.
+
 **Undo / redo.** Every operation is a step: importing or removing parts, quantities, renames,
 flips, sheet type, hide and defects, every kind of nesting run, moving, rotating, duplicating,
 deleting or replacing a placed part, worksheet changes, opening a project. Ctrl+Z / Ctrl+Y, or

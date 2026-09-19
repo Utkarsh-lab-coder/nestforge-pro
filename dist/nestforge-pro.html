@@ -1506,10 +1506,23 @@ body { background: var(--bg); color: var(--text); font-family: var(--font-ui); f
         <div class="field"><label>Margin (<span class="unit-label">mm</span>)</label><input type="number" id="s-margin" value="5" min="0" max="100"></div>
         <div class="field"><label>Gap (<span class="unit-label">mm</span>)</label><input type="number" id="s-gap" value="2" min="0" max="50" step="0.5"></div>
       </div>
-      <label style="display:flex;align-items:center;gap:8px;margin-top:4px;padding:6px 8px;background:var(--card);border:1px solid var(--border2);border-radius:4px;cursor:pointer;font-size:12px;color:var(--text2)">
-        <input type="checkbox" id="s-auto-length" checked style="accent-color:var(--accent);width:14px;height:14px;flex-shrink:0">
-        <span>Auto-expand length to fit all parts<br><span style="font-size:10px;color:var(--text3);font-family:var(--font-mono)">Width stays fixed, height auto-adjusts</span></span>
-      </label>
+      <div style="margin-top:4px;padding:6px 8px;background:var(--card);border:1px solid var(--border2);border-radius:4px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--text2)">
+          <input type="checkbox" id="s-auto-length" checked style="accent-color:var(--accent);width:14px;height:14px;flex-shrink:0" onchange="App._onGrowToggle()">
+          <span>Grow the sheet when parts overflow</span>
+        </label>
+        <div id="grow-dir-row" style="display:flex;align-items:center;gap:8px;margin-top:6px;padding-left:22px">
+          <span style="font-size:11px;color:var(--text3);white-space:nowrap">Grow</span>
+          <select id="s-grow-dir" style="flex:1" title="Which way the sheet grows when the parts do not fit">
+            <option value="length">Length (height) — width stays fixed</option>
+            <option value="width">Width — height stays fixed</option>
+            <option value="both">Both, keeping the proportions</option>
+          </select>
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:4px;line-height:1.5;padding-left:22px">
+          Off: the sheet stays exactly as set and parts that do not fit are reported. "More sheets if parts overflow" (Copies section) takes precedence over growing.
+        </div>
+      </div>
     </div>
 
     <!-- Algorithm Settings -->
@@ -13833,6 +13846,10 @@ const PolyNestEngine = {
     if (this._diversitySeed) {
       console.log(`[NestForge engine] Diversity seed=${this._diversitySeed.toString(16)} active`);
     }
+    // Growing in width (app auto-expand with an effectively infinite width):
+    // pack height-first so the fixed height fills before the layout
+    // extends to the right, mirroring the usual width-first fill.
+    this._growAxisX = settings._growAxis === 'x';
     if (settings.componentRules && this._zoneCenters) {
       for (const rule of settings.componentRules.values()) {
         if (rule && rule.allowedZones && rule.allowedZones.size) {
@@ -15886,20 +15903,26 @@ const PolyNestEngine = {
                 break;
               }
             }
+            // Width-growth runs swap the axes: the fixed height fills first.
+            const gx = this._growAxisX;
+            const M1 = gx ? newMaxX : newMaxY, M2 = gx ? newMaxY : newMaxX;
+            const h1 = gx ? hit.x : hit.y, h2 = gx ? hit.y : hit.x;
             if (insidePlacedBBox) {
               // True cavity: subtract a large bonus that dominates the
               // tiebreaker (max ~13k for 1250mm sheet) but is smaller
               // than newMaxX*1e3 (so it never beats a position with a
               // smaller newMaxX). Tiebreaker among cavities: standard BL.
-              cost = newMaxY * 1e6 + newMaxX * 1e3 - 1e5 + hit.y * 10 + hit.x;
+              cost = M1 * 1e6 + M2 * 1e3 - 1e5 + h1 * 10 + h2;
             } else {
               // Internal placement (strip): prefer deeper (higher y) positions.
               // -y * 10 - x makes higher y/x give lower (better) cost.
-              cost = newMaxY * 1e6 + newMaxX * 1e3 - hit.y * 10 - hit.x;
+              cost = M1 * 1e6 + M2 * 1e3 - h1 * 10 - h2;
             }
           } else {
             // External placement (extending bbox): standard BL.
-            cost = newMaxY * 1e6 + newMaxX * 1e3 + hit.y * 10 + hit.x;
+            const gx = this._growAxisX;
+            cost = gx ? (newMaxX * 1e6 + newMaxY * 1e3 + hit.x * 10 + hit.y)
+                      : (newMaxY * 1e6 + newMaxX * 1e3 + hit.y * 10 + hit.x);
           }
         } else {
           // Nest mode: minimise bbox AREA for tight compact packs.
@@ -27198,7 +27221,21 @@ const App = {
         const el = document.getElementById('s-auto-length');
         return el ? !!el.checked : true;
       })(),
+      // Which way the sheet grows when parts overflow: 'length' (height,
+      // width fixed), 'width' (height fixed) or 'both' (proportionally).
+      growDir: (function() {
+        const el = document.getElementById('s-grow-dir');
+        return el && ['length', 'width', 'both'].includes(el.value) ? el.value : 'length';
+      })(),
     };
+  },
+
+  _onGrowToggle() {
+    const on = document.getElementById('s-auto-length').checked;
+    const row = document.getElementById('grow-dir-row');
+    if (row) row.style.opacity = on ? '' : '0.45';
+    const sel = document.getElementById('s-grow-dir');
+    if (sel) sel.disabled = !on;
   },
 
   async runNesting() {
@@ -28176,16 +28213,55 @@ const App = {
         tooWide.push({ name: p.name, w: narrowest });
       }
     }
-    if (tooWide.length) {
+    // How the sheet may grow on this run: not at all for Fill, more-sheets
+    // and hides (a hide is real material), else the chosen direction, or
+    // 'none' when growing is switched off (the sheet is then exactly as set).
+    const _hideNow = !!(this._sheetOutline && this._sheetOutline.length >= 3);
+    const growDir = (settings.autoLength && !settings.fillSheet && !settings.multiSheet && !_hideNow)
+      ? (settings.growDir || 'length') : 'none';
+    const mayGrowW = growDir === 'width' || growDir === 'both';
+    const mayGrowH = growDir === 'length' || growDir === 'both';
+    if (tooWide.length && mayGrowW) {
+      // The width may grow: make room for the widest part instead of stopping.
+      const minNeeded = Math.ceil(Math.max(...tooWide.map(t => t.w)) + 2 * settings.margin);
+      settings.sheetW = minNeeded;
+      document.getElementById('s-width').value = minNeeded;
+      Renderer.sheetW = minNeeded;
+    } else if (tooWide.length) {
       const detail = tooWide.map(t => `  • ${t.name} → needs ${t.w.toFixed(0)}mm`).join('\n');
       const minNeeded = Math.ceil(Math.max(...tooWide.map(t => t.w)) + 2*settings.margin);
       alert(
         `${tooWide.length} part(s) are wider than the sheet:\n\n${detail}\n\n` +
         `Usable width is ${usableW.toFixed(0)}mm  (sheet ${settings.sheetW}mm − 2× margin ${settings.margin}mm).\n\n` +
-        `Increase sheet width to at least ${minNeeded}mm,\n` +
+        `Increase sheet width to at least ${minNeeded}mm, let the sheet grow in width,\n` +
         `OR enable more rotation options (currently: ${rotsToTry.join('°, ')}°).`
       );
       return;
+    }
+    if (!mayGrowH && !settings.fillSheet && !settings.multiSheet && !_hideNow) {
+      // The height may not grow either: a part taller than the sheet in
+      // every allowed rotation cannot be placed; say so rather than drop it.
+      const usableH = settings.sheetH - 2 * settings.margin;
+      const tooTall = [];
+      for (const p of this.parts) {
+        let shortest = Infinity;
+        for (const rot of rotsToTry) {
+          const rb = polyBBox(rotatePts(p.pts, rot));
+          if (rb.h < shortest) shortest = rb.h;
+        }
+        if (shortest > usableH + 0.5) tooTall.push({ name: p.name, h: shortest });
+      }
+      if (tooTall.length) {
+        const detail = tooTall.map(t => `  • ${t.name} → needs ${t.h.toFixed(0)}mm`).join('\n');
+        const minNeeded = Math.ceil(Math.max(...tooTall.map(t => t.h)) + 2 * settings.margin);
+        alert(
+          `${tooTall.length} part(s) are taller than the sheet:\n\n${detail}\n\n` +
+          `Usable height is ${usableH.toFixed(0)}mm.\n\n` +
+          `Increase sheet height to at least ${minNeeded}mm, let the sheet grow in length,\n` +
+          `OR enable more rotation options (currently: ${rotsToTry.join('°, ')}°).`
+        );
+        return;
+      }
     }
 
     Renderer.sheetW = settings.sheetW;
@@ -28284,31 +28360,68 @@ const App = {
       // Result: engine fills full width tightly (like Fill Sheet does),
       // packs as many rows as needed until copies count reached,
       // then sheet auto-trims to fit exactly what was placed.
+      // Growing in WIDTH works the same way mirrored: an effectively infinite
+      // width and the polygon engine packing height-first (_growAxis 'x'),
+      // then the width is trimmed. The lane engine fills a row before it
+      // starts the next, so with an infinite width it would make one endless
+      // row; with Cutting Flow on, width and both-ways growth use the
+      // step-by-step growth below instead.
       const _isHide = !!(this._sheetOutline && this._sheetOutline.length >= 3);
       let _autoExpandMode = false;
+      let _autoExpandAxis = 'y';
       let _autoExpandTargetCopies = 0;
-      if (settings.autoLength && !settings.fillSheet && !settings.multiSheet && !_isHide && settings.copies > 1) {
+      const _autoExpandOK = growDir === 'length' || (growDir === 'width' && !settings.cuttingFlow);
+      if (growDir !== 'none' && _autoExpandOK && settings.copies > 1) {
         _autoExpandMode = true;
+        _autoExpandAxis = growDir === 'width' ? 'x' : 'y';
         _autoExpandTargetCopies = settings.copies;
-        // Effectively infinite height — engine treats it as unbounded
-        settings.sheetH = 50000;
-        document.getElementById('s-height').value = 50000;
-        Renderer.sheetH = 50000;
+        if (_autoExpandAxis === 'y') {
+          // Effectively infinite height — engine treats it as unbounded
+          settings.sheetH = 50000;
+          document.getElementById('s-height').value = 50000;
+          Renderer.sheetH = 50000;
+        } else {
+          settings.sheetW = 50000;
+          document.getElementById('s-width').value = 50000;
+          Renderer.sheetW = 50000;
+          settings._growAxis = 'x';
+        }
         // Force fillSheet mode so engine uses tight-packing logic
         settings.fillSheet = true;
         // But cap queue: instead of inflating to fill 50000mm height,
         // give engine EXACTLY copies parts. Engine packs them tightly
         // and stops when queue exhausted.
         settings._autoExpandQueueCap = _autoExpandTargetCopies;
-        console.log('[NestForge] Auto-expand: width=' + settings.sheetW + 'mm, target=' + _autoExpandTargetCopies + ' copies, infinite height');
+        console.log('[NestForge] Auto-expand: ' + (_autoExpandAxis === 'y' ? 'width=' + settings.sheetW + 'mm, infinite height' : 'height=' + settings.sheetH + 'mm, infinite width') + ', target=' + _autoExpandTargetCopies + ' copies');
       }
 
       const origH = settings.sheetH;
+      const origW = settings.sheetW;
+      // One step of growth for the loops below: the area still needed,
+      // applied to the growing dimension(s). Returns false when the sheet
+      // may not grow or hit the safety cap.
+      const growSheet = (ratio) => {
+        if (growDir === 'none') return false;
+        const CAP = 100000;
+        const bump = (cur, f) => { const n = Math.ceil(cur * f); return n <= cur ? Math.ceil(cur * 1.5) : n; };
+        let W = settings.sheetW, H = settings.sheetH;
+        if (growDir === 'length') H = bump(H, ratio);
+        else if (growDir === 'width') W = bump(W, ratio);
+        else { const f = Math.sqrt(ratio); W = bump(W, f); H = bump(H, f); }
+        if (W > CAP || H > CAP) return false;
+        settings.sheetW = W; settings.sheetH = H;
+        document.getElementById('s-width').value = W;
+        document.getElementById('s-height').value = H;
+        Renderer.sheetW = W; Renderer.sheetH = H;
+        return true;
+      };
+      const grownTo = () => growDir === 'width' ? `${settings.sheetW}mm wide`
+        : growDir === 'both' ? `${settings.sheetW}×${settings.sheetH}mm` : `${settings.sheetH}mm`;
 
       // ── Pre-check: ensure sheet is at least as tall as the tallest part ──
       // No inflation based on area — that caused oversized canvases. We rely
       // on auto-grow to find the right height, then shrink-to-fit at the end.
-      if (!settings.fillSheet) {
+      if (!settings.fillSheet && mayGrowH) {
         const tallestPart = this.parts.reduce((m, p) => {
           const bb = polyBBox(p.pts);
           return Math.max(m, Math.min(bb.w, bb.h)); // min(w,h) because rotation could lay it sideways
@@ -28524,20 +28637,25 @@ const App = {
         // Reset auto-grow attempts per strategy
         let thisResult = null;
         let thisAttempts = 0;
-        // Reset sheet height for each strategy (avoid contamination)
-        settings.sheetH = origH;
+        // Reset sheet size for each strategy (avoid contamination)
+        settings.sheetH = origH; settings.sheetW = origW;
         document.getElementById('s-height').value = origH;
-        Renderer.sheetH = origH;
+        document.getElementById('s-width').value = origW;
+        Renderer.sheetH = origH; Renderer.sheetW = origW;
 
-        while (thisAttempts < MAX_ATTEMPTS) {
+        let lastFail = null;   // the last sheet size the parts did not fit on
+        const nestOnce = async () => {
           const partsForNestRaw = this.parts.map(p =>
             this._applyComponentRules(p, settings.rotations, settings.mirrorMode)
           );
           const partsForNest = this._expandForMustMirror(partsForNestRaw, settings.mirrorMode);
           nestDefCount = partsForNest.length;
-          thisResult = await nestFn.call(NestEngine,
+          return await nestFn.call(NestEngine,
             partsForNest, settings, onProgress, () => this._cancelled, onPlacement
           );
+        };
+        while (thisAttempts < MAX_ATTEMPTS) {
+          thisResult = await nestOnce();
           if (this._cancelled) break;
           if (thisResult.unplaced === 0 || settings.fillSheet || settings.multiSheet || isHideSheet) break;
 
@@ -28549,15 +28667,44 @@ const App = {
           const placedArea = thisResult.placements.reduce((s, p) => s + polyArea(p.pts), 0);
           const totalArea  = this.parts.reduce((s, p) => s + polyArea(p.pts), 0) * settings.copies;
           let ratio = placedArea > 0 ? (totalArea / placedArea) * 1.15 : 2.5;
-          const newH = Math.ceil(settings.sheetH * ratio);
-          if (newH > 100000) break;
-          settings.sheetH = newH <= settings.sheetH ? Math.ceil(settings.sheetH * 1.5) : newH;
-          document.getElementById('s-height').value = settings.sheetH;
-          Renderer.sheetH = settings.sheetH;
+          lastFail = { W: settings.sheetW, H: settings.sheetH };
+          if (!growSheet(ratio)) break;
           document.getElementById('prog-sub').textContent =
-            `Auto-fit: growing to ${settings.sheetH}mm…`;
+            `Auto-fit: growing to ${grownTo()}…`;
           await sleep(0);
           thisAttempts++;
+        }
+        // ── Tighten a grown sheet ─────────────────────────────────────
+        // The growth step jumps by the area still needed plus 15%, so the
+        // first size that fits is usually bigger than necessary, and a lane
+        // layout spans whatever width it is given, so it cannot be trimmed
+        // afterwards. Search between the last size that failed and the one
+        // that fit, keeping the smallest sheet on which everything fits.
+        if (!this._cancelled && lastFail && thisResult && thisResult.unplaced === 0 && growDir !== 'none') {
+          const setSize = (W, H) => {
+            settings.sheetW = W; settings.sheetH = H;
+            document.getElementById('s-width').value = W;
+            document.getElementById('s-height').value = H;
+            Renderer.sheetW = W; Renderer.sheetH = H;
+          };
+          let lo = lastFail, hi = { W: settings.sheetW, H: settings.sheetH };
+          let best = thisResult;
+          for (let k = 0; k < 4; k++) {
+            const span = growDir === 'width' ? (hi.W - lo.W) / hi.W : growDir === 'length' ? (hi.H - lo.H) / hi.H
+              : Math.max((hi.W - lo.W) / hi.W, (hi.H - lo.H) / hi.H);
+            if (span < 0.04) break;
+            const mid = {
+              W: mayGrowW ? Math.ceil((lo.W + hi.W) / 2) : hi.W,
+              H: mayGrowH ? Math.ceil((lo.H + hi.H) / 2) : hi.H,
+            };
+            setSize(mid.W, mid.H);
+            liveResult.placements = []; liveResult.placed = 0; scheduleDraw();
+            document.getElementById('prog-sub').textContent = `Auto-fit: trying a smaller sheet, ${grownTo()}…`;
+            const r = await nestOnce();
+            if (this._cancelled) break;
+            if (r.unplaced === 0) { hi = mid; best = r; } else lo = mid;
+          }
+          if (!this._cancelled) { setSize(hi.W, hi.H); thisResult = best; }
         }
 
         // Score and compare
@@ -28640,18 +28787,9 @@ const App = {
         } else {
           ratio = 2.5; // nothing fit → grow aggressively
         }
-        const newH = Math.ceil(settings.sheetH * ratio);
-        if (newH > 100000) break; // safety cap
-        if (newH <= settings.sheetH) {
-          // Loop made no progress — bump by 50% as a last try
-          settings.sheetH = Math.ceil(settings.sheetH * 1.5);
-        } else {
-          settings.sheetH = newH;
-        }
-        document.getElementById('s-height').value = settings.sheetH;
-        Renderer.sheetH = settings.sheetH;
+        if (!growSheet(ratio)) break;   // the sheet may not grow (or hit the cap): report what did not fit
         document.getElementById('prog-sub').textContent =
-          `Auto-fit: growing to ${settings.sheetH}mm  (${result.unplaced} part(s) didn't fit, retrying…)`;
+          `Auto-fit: growing to ${grownTo()}  (${result.unplaced} part(s) didn't fit, retrying…)`;
         await sleep(0);
         attempts++;
       }
@@ -28666,17 +28804,28 @@ const App = {
       // not), shrink the 50000mm-tall sheet down to fit the actual
       // placements. Width stays at user's value.
       if (_autoExpandMode && result && result.placements && result.placements.length > 0) {
-        let maxBottomY = 0;
+        let maxBottomY = 0, maxRightX = 0;
         for (const pl of result.placements) {
           const bb = polyBBox(pl.pts);
-          const bottom = pl.y + bb.h;
+          const bottom = pl.y + bb.h, right = pl.x + bb.w;
           if (bottom > maxBottomY) maxBottomY = bottom;
+          if (right > maxRightX) maxRightX = right;
         }
-        const tightH = Math.ceil(maxBottomY + settings.margin);
-        if (tightH >= 2 * settings.margin + 10) {
-          settings.sheetH = tightH;
-          document.getElementById('s-height').value = tightH;
-          Renderer.sheetH = tightH;
+        if (_autoExpandAxis === 'y') {
+          const tightH = Math.ceil(maxBottomY + settings.margin);
+          if (tightH >= 2 * settings.margin + 10) {
+            settings.sheetH = tightH;
+            document.getElementById('s-height').value = tightH;
+            Renderer.sheetH = tightH;
+          }
+        } else {
+          const tightW = Math.ceil(maxRightX + settings.margin);
+          if (tightW >= 2 * settings.margin + 10) {
+            settings.sheetW = tightW;
+            document.getElementById('s-width').value = tightW;
+            Renderer.sheetW = tightW;
+          }
+          delete settings._growAxis;
         }
         // Restore fillSheet=false for status display consistency
         settings.fillSheet = false;
@@ -28690,22 +28839,36 @@ const App = {
           result.unplaced = 0;
         }
       }
+      // A sheet that may grow may also shrink, in the same direction(s); a
+      // fixed sheet (growing off) stays exactly as set.
       if (!this._cancelled && result && result.unplaced === 0 && !settings.fillSheet
-          && !settings.multiSheet && !isHideSheet
+          && !settings.multiSheet && !isHideSheet && growDir !== 'none'
           && result.placements.length > 0 && !_autoExpandMode) {
-        let maxBottomY = 0;
+        let maxBottomY = 0, maxRightX = 0;
         for (const pl of result.placements) {
           const bb = polyBBox(pl.pts);
-          const bottom = pl.y + bb.h;
+          const bottom = pl.y + bb.h, right = pl.x + bb.w;
           if (bottom > maxBottomY) maxBottomY = bottom;
+          if (right > maxRightX) maxRightX = right;
         }
-        const tightH = Math.ceil(maxBottomY + settings.margin);
-        // Only shrink if the savings are meaningful (> 5mm or > 2% of current H)
-        const minSaving = Math.max(5, settings.sheetH * 0.02);
-        if (tightH < settings.sheetH - minSaving && tightH >= 2 * settings.margin + 10) {
-          settings.sheetH = tightH;
-          document.getElementById('s-height').value = tightH;
-          Renderer.sheetH = tightH;
+        if (mayGrowH) {
+          const tightH = Math.ceil(maxBottomY + settings.margin);
+          // Only shrink if the savings are meaningful (> 5mm or > 2% of current H)
+          const minSaving = Math.max(5, settings.sheetH * 0.02);
+          if (tightH < settings.sheetH - minSaving && tightH >= 2 * settings.margin + 10) {
+            settings.sheetH = tightH;
+            document.getElementById('s-height').value = tightH;
+            Renderer.sheetH = tightH;
+          }
+        }
+        if (mayGrowW) {
+          const tightW = Math.ceil(maxRightX + settings.margin);
+          const minSavingW = Math.max(5, settings.sheetW * 0.02);
+          if (tightW < settings.sheetW - minSavingW && tightW >= 2 * settings.margin + 10) {
+            settings.sheetW = tightW;
+            document.getElementById('s-width').value = tightW;
+            Renderer.sheetW = tightW;
+          }
         }
       }
 
@@ -28726,15 +28889,16 @@ const App = {
         if (imp) imp.disabled = (result.placed === 0) || window.__useRasterEngine;
         const flowTag = result.cuttingFlow ? ' ✂ FLOW' + (result.flowLabel ? ' (' + result.flowLabel + ')' : '') : '';
         const engineTag = window.__useRasterEngine ? ' [raster]' : ' [polygon-NFP]';
-        const grewTag = (settings.sheetH !== origH)
-          ? `  •  Auto-fit H: ${origH}→${settings.sheetH}mm`
-          : '';
+        const grewTag = ((settings.sheetH !== origH) ? `  •  Auto-fit H: ${origH}→${settings.sheetH}mm` : '')
+                      + ((settings.sheetW !== origW) ? `  •  Auto-fit W: ${origW}→${settings.sheetW}mm` : '');
         const sheetTag = (result.sheetCount > 1)
           ? `  •  📑 ${result.sheetCount} sheets`
           : '';
         let setsTag = '';
         let unplacedTag = result.unplaced > 0
-          ? `  •  ⚠ ${result.unplaced} too wide for sheet (increase Width)`
+          ? (growDir === 'none'
+              ? `  •  ⚠ ${result.unplaced} part(s) did not fit — the sheet is fixed (turn on Grow the sheet, or More sheets if parts overflow)`
+              : `  •  ⚠ ${result.unplaced} part(s) did not fit`)
           : '';
         if (result.sets) {
           const S = result.sets;
@@ -29370,6 +29534,9 @@ const App = {
       if (s.gap != null)    setVal('s-gap',    this._formatNum(s.gap / u));
       setVal('mirror-mode', s.mirrorMode);
       setVal('s-copies', s.copies);
+      setVal('s-grow-dir', s.growDir);
+      const al = document.getElementById('s-auto-length');
+      if (al && s.autoLength != null) { al.checked = !!s.autoLength; this._onGrowToggle && this._onGrowToggle(); }
       // Multi-sheet checkbox
       const ms = document.getElementById('s-multi-sheet');
       if (ms && s.multiSheet != null) ms.checked = !!s.multiSheet;

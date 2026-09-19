@@ -213,10 +213,23 @@
         <div class="field"><label>Margin (<span class="unit-label">mm</span>)</label><input type="number" id="s-margin" value="5" min="0" max="100"></div>
         <div class="field"><label>Gap (<span class="unit-label">mm</span>)</label><input type="number" id="s-gap" value="2" min="0" max="50" step="0.5"></div>
       </div>
-      <label style="display:flex;align-items:center;gap:8px;margin-top:4px;padding:6px 8px;background:var(--card);border:1px solid var(--border2);border-radius:4px;cursor:pointer;font-size:12px;color:var(--text2)">
-        <input type="checkbox" id="s-auto-length" checked style="accent-color:var(--accent);width:14px;height:14px;flex-shrink:0">
-        <span>Auto-expand length to fit all parts<br><span style="font-size:10px;color:var(--text3);font-family:var(--font-mono)">Width stays fixed, height auto-adjusts</span></span>
-      </label>
+      <div style="margin-top:4px;padding:6px 8px;background:var(--card);border:1px solid var(--border2);border-radius:4px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--text2)">
+          <input type="checkbox" id="s-auto-length" checked style="accent-color:var(--accent);width:14px;height:14px;flex-shrink:0" onchange="App._onGrowToggle()">
+          <span>Grow the sheet when parts overflow</span>
+        </label>
+        <div id="grow-dir-row" style="display:flex;align-items:center;gap:8px;margin-top:6px;padding-left:22px">
+          <span style="font-size:11px;color:var(--text3);white-space:nowrap">Grow</span>
+          <select id="s-grow-dir" style="flex:1" title="Which way the sheet grows when the parts do not fit">
+            <option value="length">Length (height) — width stays fixed</option>
+            <option value="width">Width — height stays fixed</option>
+            <option value="both">Both, keeping the proportions</option>
+          </select>
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:4px;line-height:1.5;padding-left:22px">
+          Off: the sheet stays exactly as set and parts that do not fit are reported. "More sheets if parts overflow" (Copies section) takes precedence over growing.
+        </div>
+      </div>
     </div>
 
     <!-- Algorithm Settings -->

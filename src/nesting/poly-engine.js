@@ -230,6 +230,10 @@ const PolyNestEngine = {
     if (this._diversitySeed) {
       console.log(`[NestForge engine] Diversity seed=${this._diversitySeed.toString(16)} active`);
     }
+    // Growing in width (app auto-expand with an effectively infinite width):
+    // pack height-first so the fixed height fills before the layout
+    // extends to the right, mirroring the usual width-first fill.
+    this._growAxisX = settings._growAxis === 'x';
     if (settings.componentRules && this._zoneCenters) {
       for (const rule of settings.componentRules.values()) {
         if (rule && rule.allowedZones && rule.allowedZones.size) {
@@ -2283,20 +2287,26 @@ const PolyNestEngine = {
                 break;
               }
             }
+            // Width-growth runs swap the axes: the fixed height fills first.
+            const gx = this._growAxisX;
+            const M1 = gx ? newMaxX : newMaxY, M2 = gx ? newMaxY : newMaxX;
+            const h1 = gx ? hit.x : hit.y, h2 = gx ? hit.y : hit.x;
             if (insidePlacedBBox) {
               // True cavity: subtract a large bonus that dominates the
               // tiebreaker (max ~13k for 1250mm sheet) but is smaller
               // than newMaxX*1e3 (so it never beats a position with a
               // smaller newMaxX). Tiebreaker among cavities: standard BL.
-              cost = newMaxY * 1e6 + newMaxX * 1e3 - 1e5 + hit.y * 10 + hit.x;
+              cost = M1 * 1e6 + M2 * 1e3 - 1e5 + h1 * 10 + h2;
             } else {
               // Internal placement (strip): prefer deeper (higher y) positions.
               // -y * 10 - x makes higher y/x give lower (better) cost.
-              cost = newMaxY * 1e6 + newMaxX * 1e3 - hit.y * 10 - hit.x;
+              cost = M1 * 1e6 + M2 * 1e3 - h1 * 10 - h2;
             }
           } else {
             // External placement (extending bbox): standard BL.
-            cost = newMaxY * 1e6 + newMaxX * 1e3 + hit.y * 10 + hit.x;
+            const gx = this._growAxisX;
+            cost = gx ? (newMaxX * 1e6 + newMaxY * 1e3 + hit.x * 10 + hit.y)
+                      : (newMaxY * 1e6 + newMaxX * 1e3 + hit.y * 10 + hit.x);
           }
         } else {
           // Nest mode: minimise bbox AREA for tight compact packs.
