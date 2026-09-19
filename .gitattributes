@@ -5,3 +5,6 @@
 *.png binary
 *.jpg binary
 *.ico binary
+
+# DXF is conventionally CRLF and the reader accepts either; keep the files exactly as generated
+*.dxf -text
