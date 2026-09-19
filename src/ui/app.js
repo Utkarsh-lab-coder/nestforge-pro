@@ -644,7 +644,7 @@ const App = {
     let hit = null;
     for (let i = placements.length - 1; i >= 0; i--) {  // top-most first
       const pl = placements[i];
-      const wp = pl.worldPoly || (pl.pts && pl.pts.map(p => [p[0]+pl.x, p[1]+pl.y]));
+      const wp = PU.worldPolyOf(pl);
       if (!wp || wp.length < 3) continue;
       // Ray-cast point in polygon
       let inside = false;
@@ -826,7 +826,7 @@ const App = {
       startPlY: pl.y,
       startRotation: pl.rotation || 0,
       origPts: pl.pts.map(p => [p[0], p[1]]),  // deep copy of pts at start
-      origWorldPoly: (pl.worldPoly || pl.pts.map(p => [p[0]+pl.x, p[1]+pl.y])).map(p => [p[0], p[1]]),
+      origWorldPoly: PU.worldPolyOf(pl).map(p => [p[0], p[1]]),
       origInnerLines: (pl.innerLines || []).map(il => ({
         pts: il.pts.map(p => [p[0], p[1]]),
         color: il.color, layer: il.layer, closed: il.closed,
@@ -854,8 +854,7 @@ const App = {
         pts: il.pts.map(p => [p[0], p[1]]),
         color: il.color, layer: il.layer, closed: il.closed,
       }));
-      const bb = polyBBox(pl.pts);
-      pl.worldPoly = pl.pts.map(p => [p[0] - bb.x + pl.x, p[1] - bb.y + pl.y]);
+      pl.worldPoly = this._usablePolyOf(pl);
     } else if (dragState.mode === 'rotate') {
       // Rotate around centroid by mouse-angle delta
       const curAngle = Math.atan2(sheetY - dragState.centroidY, sheetX - dragState.centroidX);
@@ -884,9 +883,22 @@ const App = {
       const bb = polyBBox(pl.pts);
       pl.x = dragState.centroidX - bb.w / 2;
       pl.y = dragState.centroidY - bb.h / 2;
-      pl.worldPoly = pl.pts.map(p => [p[0] - bb.x + pl.x, p[1] - bb.y + pl.y]);
+      pl.worldPoly = this._usablePolyOf(pl);
     }
     Renderer.draw();
+  },
+
+  /* Margin in mm (the settings field is in the display unit). */
+  _marginMM() {
+    return (parseFloat(document.getElementById('s-margin').value) || 0) * (this._unitToMM ? this._unitToMM() : 1);
+  },
+
+  /* A placement's outline in the engines' usable-area frame (sheet frame
+     minus the margin): what pl.worldPoly must hold so Improve, Phase 4
+     and replacement see a hand-moved part where it really is. */
+  _usablePolyOf(pl) {
+    const m = this._marginMM();
+    return PU.worldPolyOf(pl).map(p => [p[0] - m, p[1] - m]);
   },
 
   _endPlacementDrag(dragState) {
@@ -897,11 +909,12 @@ const App = {
     const settings = this.getSettings();
     const gap = settings.gap || 2;
     let invalidReason = null;
-    const aBB = polyBBox(pl.worldPoly);
+    const plWP = PU.worldPolyOf(pl);   // sheet frame, as drawn
+    const aBB = polyBBox(plWP);
 
     // Check hide outline (if any)
     if (this._sheetOutline && this._sheetOutline.length >= 3) {
-      for (const v of pl.worldPoly) {
+      for (const v of plWP) {
         if (!PU.contains(this._sheetOutline, v)) {
           invalidReason = 'outside hide outline';
           break;
@@ -922,7 +935,7 @@ const App = {
         if (i === this._selectedPlacementIdx) continue;
         const other = this.nestResult.placements[i];
         if (other.sheet !== pl.sheet) continue;  // different sheets can't overlap
-        const oWP = other.worldPoly || other.pts.map(p => [p[0]+other.x, p[1]+other.y]);
+        const oWP = PU.worldPolyOf(other);
         const bBB = polyBBox(oWP);
         // Bbox pre-filter with gap margin
         if (aBB.x > bBB.x + bBB.w + gap) continue;
@@ -931,7 +944,7 @@ const App = {
         if (aBB.y + aBB.h < bBB.y - gap) continue;
         // Inflate other by gap and test intersection
         const otherInflated = PU.offsetSingle(oWP, gap, 'square') || oWP;
-        const inter = PU.intersection([pl.worldPoly], [otherInflated]);
+        const inter = PU.intersection([plWP], [otherInflated]);
         if (inter.length > 0 && inter[0].length >= 3 && PU.area(inter[0]) > 0.5) {
           invalidReason = 'overlaps ' + (other.partName || 'another part');
           break;
@@ -943,7 +956,7 @@ const App = {
     if (!invalidReason && this._defects && this._defects.length) {
       for (const d of this._defects) {
         if (d.shape && d.shape.length >= 3) {
-          const inter = PU.intersection([pl.worldPoly], [d.shape]);
+          const inter = PU.intersection([plWP], [d.shape]);
           if (inter.length > 0 && inter[0].length >= 3 && PU.area(inter[0]) > 0.5) {
             invalidReason = 'overlaps defect';
             break;
@@ -951,7 +964,7 @@ const App = {
         } else {
           // Circle defect
           const r2 = (d.r + gap) * (d.r + gap);
-          for (const v of pl.worldPoly) {
+          for (const v of plWP) {
             const dx = v[0] - d.x, dy = v[1] - d.y;
             if (dx*dx + dy*dy < r2) { invalidReason = 'overlaps defect'; break; }
           }
@@ -1017,7 +1030,7 @@ const App = {
       _uid: 'cp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
       _copiedFrom: orig._uid,
       pts: orig.pts.map(p => [p[0], p[1]]),
-      worldPoly: (orig.worldPoly || orig.pts.map(p => [p[0]+orig.x, p[1]+orig.y])).map(p => [p[0], p[1]]),
+      worldPoly: this._usablePolyOf(orig),
       localPoly: orig.localPoly ? orig.localPoly.map(p => [p[0], p[1]]) : undefined,
       innerLines: (orig.innerLines || []).map(il => ({
         pts: il.pts.map(p => [p[0], p[1]]),
@@ -1069,7 +1082,7 @@ const App = {
       );
       // Fake remaining placed list with worldPoly entries
       const placed = remainingPlacements.map(pl => ({
-        worldPoly: pl.worldPoly || pl.pts.map(p => [p[0]+pl.x, p[1]+pl.y]),
+        worldPoly: this._usablePolyOf(pl),
         _variantKey: pl.variantKey || 'unknown',
         x: pl.nfpX != null ? pl.nfpX : pl.x,
         y: pl.nfpY != null ? pl.nfpY : pl.y,
@@ -3692,6 +3705,13 @@ const App = {
      ═════════════════════════════════════════════════════════════════ */
 
   saveProject() {
+    const payload = this._buildProjectPayload();
+    this._downloadProject(payload);
+  },
+
+  /* The whole project as one JSON-friendly object: what Save Project
+     writes and what undo/redo snapshots (src/ui/history.js). */
+  _buildProjectPayload() {
     // Snapshot current worksheet to its slot before serializing
     try { this._saveCurrentWS(); } catch (_) {}
 
@@ -3762,7 +3782,10 @@ const App = {
         try { return this.getSettings(); } catch (_) { return null; }
       })(),
     };
+    return payload;
+  },
 
+  _downloadProject(payload) {
     // Serialize and trigger download
     const json = JSON.stringify(payload, null, 0);  // compact
     const blob = new Blob([json], { type: 'application/json' });

@@ -52,7 +52,7 @@ const Measure = {
 
   // World outline of a placement (sheet mm).
   _worldPoly(pl) {
-    return pl.worldPoly || (pl.pts && pl.pts.map(p => [p[0] + pl.x, p[1] + pl.y])) || null;
+    return PU.worldPolyOf(pl);
   },
 
   // Placements on the sheet currently shown.

@@ -1319,6 +1319,8 @@ body { background: var(--bg); color: var(--text); font-family: var(--font-ui); f
   <button class="header-btn mobile-hide" onclick="App.openZip()" title="Import ZIP file">🗜 ZIP</button>
   <button class="header-btn mobile-hide" onclick="App.openProjectFile()" title="Open a saved .nfp project file">📁 Open Project</button>
   <button class="header-btn mobile-hide" onclick="App.saveProject()" title="Save all parts, sheets, settings & rules to .nfp project file">💾 Save Project</button>
+  <button class="header-btn mobile-hide" id="btn-undo" onclick="History.undo()" title="Nothing to undo (Ctrl+Z)" disabled>↶</button>
+  <button class="header-btn mobile-hide" id="btn-redo" onclick="History.redo()" title="Nothing to redo (Ctrl+Y)" disabled>↷</button>
   <button class="header-btn primary mobile-hide" id="btn-nest" onclick="App.runNesting()" disabled>▶ Run Nesting</button>
   <button class="header-btn mobile-hide" id="btn-advanced" onclick="App.runAdvancedNesting()" disabled title="GA-based deep search: generates 6+ candidate layouts with different random seeds, picks best, then polishes. Takes 2-3 minutes. Won't replace your current result unless strictly better.">🧬 Run Advanced Nesting</button>
   <button class="header-btn mobile-hide" id="btn-improve" onclick="App.tryImprove()" disabled title="Add more parts to current layout in empty gaps (like manual placement, automated). Keeps all existing placements.">🔄 Improve</button>
@@ -2530,6 +2532,21 @@ const PU = {  // PolyUtils
 
   translate(pts, dx, dy) {
     return pts.map(([x, y]) => [x + dx, y + dy]);
+  },
+
+  /* The outline of a placed part in SHEET coordinates, exactly as it is
+     drawn: a placement's (x, y) is where the part's bounding-box corner
+     sits (margin included) and its pts are the rotated / mirrored outline
+     as rotated about the origin, so the outline is moved by
+     (x - bbox.minX, y - bbox.minY). Always computed from pts: the engines'
+     pl.worldPoly is in USABLE-AREA coordinates (no margin) and is theirs;
+     UI code (hit tests, dragging, measuring) must use this one. */
+  worldPolyOf(pl) {
+    if (!pl.pts || pl.pts.length < 3) return null;
+    let minX = Infinity, minY = Infinity;
+    for (const p of pl.pts) { if (p[0] < minX) minX = p[0]; if (p[1] < minY) minY = p[1]; }
+    const dx = pl.x - minX, dy = pl.y - minY;
+    return pl.pts.map(p => [p[0] + dx, p[1] + dy]);
   },
 
   rotate(pts, deg, cx = 0, cy = 0) {
@@ -16319,7 +16336,7 @@ const PolyNestEngine = {
      "Fits at rowY" means: skyline-fit Y must be ≤ rowY. If skyline has concave
      space below rowY at this X (e.g. from a shorter part placed here earlier),
      the actual placement Y can be < rowY — part slots down naturally.       */
-  placeInRowStrict(variantsWithContours, skyline, sheetW, sheetH, rowY, minX) {
+  placeInRowStrict(variantsWithContours, skyline, sheetW, sheetH, rowY, minX, okAt) {
     let best = null;
     const STEP = 1;
 
@@ -16329,13 +16346,23 @@ const PolyNestEngine = {
       const xMax = sheetW - bboxW;
       if (minX > xMax + 1e-6) continue;
       if (rowY + bboxH > sheetH + 1e-6) continue;
+      // On a hide (okAt given) a row is a band: where the hide's edge
+      // curves away, a part may sit lower than the baseline, up to three
+      // quarters of its height, so the rows follow the hide instead of
+      // stopping at its first dip.
+      const yMax = rowY + (okAt ? bboxH * 0.75 : 0);
 
       let foundX = -1, foundY = -1;
       for (let x = Math.max(0, Math.floor(minX)); x <= Math.ceil(xMax); x += STEP) {
-        const y = this.skyFit(bot, skyline, x, contourW, sheetH, bboxH);
+        let y = this.skyFit(bot, skyline, x, contourW, sheetH, bboxH);
         if (y < 0) continue;
         // Must fit AT or BELOW row baseline
         if (y > rowY + 1e-6) continue;
+        if (okAt) {
+          // Drop until the whole part is on the hide and off the defects
+          while (y <= yMax + 1e-6 && y + bboxH <= sheetH + 1e-6 && !okAt(v, x, y)) y += 2;
+          if (y > yMax + 1e-6 || y + bboxH > sheetH + 1e-6) continue;
+        }
         foundX = x; foundY = y;
         break;
       }
@@ -16357,7 +16384,7 @@ const PolyNestEngine = {
      using the skyline. The row alternation for flow mode is handled by the
      caller choosing which variants (rotA vs rotB) to pass in. This allows parts
      to naturally fill concave dead space between parts of the previous row.  */
-  placeSky(variantsWithContours, skyline, sheetW, sheetH) {
+  placeSky(variantsWithContours, skyline, sheetW, sheetH, okAt) {
     let best = null;
     const STEP = 1;
 
@@ -16369,8 +16396,14 @@ const PolyNestEngine = {
 
       let variantBestY = Infinity, variantBestX = -1;
       for (let x = 0; x <= Math.ceil(xMax); x += STEP) {
-        const y = this.skyFit(bot, skyline, x, contourW, sheetH, bboxH);
+        let y = this.skyFit(bot, skyline, x, contourW, sheetH, bboxH);
         if (y < 0) continue;
+        if (okAt) {
+          // Hide: drop a little way looking for a spot on the hide
+          const yStop = y + 40;
+          while (y <= yStop && y + bboxH <= sheetH + 1e-6 && !okAt(v, x, y)) y += 2;
+          if (y > yStop || y + bboxH > sheetH + 1e-6) continue;
+        }
         // Prefer min Y; tie-break by min X
         if (y < variantBestY - 1e-6) {
           variantBestY = y;
@@ -16490,6 +16523,57 @@ const PolyNestEngine = {
     const skyW = Math.ceil(usW) + 2;
     const skyline = new Float64Array(skyW);
 
+    // ── Hide outline and defects ─────────────────────────────────────
+    // The lane placer is skyline-only; it knew nothing about a hide, so
+    // Cutting Flow on leather could put parts off the hide and on defects
+    // (the raster flow always had its obstacle mask). Now: a 1 mm mask of
+    // forbidden cells (outside the outline, on a defect) built by the same
+    // code the raster engine uses, sampled along each part's outline at
+    // every candidate, and the exact polygon tests confirm the spot found.
+    let okAt = null;
+    const hasHide = !!(settings.sheetOutline && settings.sheetOutline.length >= 3);
+    const hasDefects = !!(settings.defects && settings.defects.length);
+    if ((hasHide || hasDefects) && typeof NestEngineRaster !== 'undefined') {
+      const MW = Math.ceil(usW) + 1, MH = Math.ceil(usH) + 1;
+      const mask = NestEngineRaster._buildObstacleMask(settings, MW, MH, 1);
+      // Defects grown by 1 mm for the exact test: the variant outline is the
+      // cleaned polygon, which can sit a fraction of a millimetre inside the
+      // raw one, so a bare test could leave the cut edge on a defect.
+      const defectsGrown = hasDefects ? settings.defects.map(d => (d.shape && d.shape.length >= 3)
+        ? { ...d, r: (d.r || 0) + 1, shape: PU.offsetSingle(d.shape, 1, 'square') || d.shape }
+        : { ...d, r: (d.r || 0) + 1 }) : null;
+      // Outline sample points per variant: every vertex plus a point every
+      // 4 mm along each edge, relative to the variant's origin.
+      const samplesOf = (v) => {
+        if (v._hideSamples) return v._hideSamples;
+        const out = [];
+        const pts = v.pts;
+        for (let i = 0; i < pts.length; i++) {
+          const a = pts[i], b = pts[(i + 1) % pts.length];
+          const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+          const n = Math.max(1, Math.ceil(len / 4));
+          for (let k = 0; k < n; k++) {
+            const t = k / n;
+            out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+          }
+        }
+        v._hideSamples = out;
+        return out;
+      };
+      okAt = (v, x, y) => {
+        if (mask) {
+          for (const [sx, sy] of samplesOf(v)) {
+            const gx = Math.floor(sx + x), gy = Math.floor(sy + y);
+            if (gx < 0 || gy < 0 || gx >= MW || gy >= MH || mask[gy * MW + gx]) return false;
+          }
+        }
+        const world = PU.translate(v.pts, x, y);
+        if (hasHide && !LeatherSheet.insideSheet(world, settings.sheetOutline)) return false;
+        if (hasDefects && LeatherSheet.overlapsDefects(world, defectsGrown)) return false;
+        return true;
+      };
+    }
+
     // Helper to commit a placement (used by both phases)
     const commitPlacement = (pl, variants, part) => {
       const v = variants[pl.vi];
@@ -16578,12 +16662,12 @@ const PolyNestEngine = {
         let variants, pl;
         if (which === 'AB') {
           const va = vcA.get(part.id), vb = vcB.get(part.id);
-          const pa = this.placeInRowStrict(va, skyline, usW, usH, rowY, curX);
-          const pb = this.placeInRowStrict(vb, skyline, usW, usH, rowY, curX);
+          const pa = this.placeInRowStrict(va, skyline, usW, usH, rowY, curX, okAt);
+          const pb = this.placeInRowStrict(vb, skyline, usW, usH, rowY, curX, okAt);
           if (pa && (!pb || pa.x <= pb.x)) { variants = va; pl = pa; } else { variants = vb; pl = pb; }
         } else {
           variants = (which === 'A' ? vcA : vcB).get(part.id);
-          pl = this.placeInRowStrict(variants, skyline, usW, usH, rowY, curX);
+          pl = this.placeInRowStrict(variants, skyline, usW, usH, rowY, curX, okAt);
         }
 
         if (pl === null) {
@@ -16649,7 +16733,7 @@ const PolyNestEngine = {
       }
 
       const variants = (useA ? vcA : vcB).get(part.id);
-      const pl = this.placeSky(variants, skyline, usW, usH);
+      const pl = this.placeSky(variants, skyline, usW, usH, okAt);
 
       if (pl === null) {
         phase2Step++;
@@ -17217,7 +17301,7 @@ const Renderer = {
       const pls = App.nestResult.placements;
       for (let i = pls.length - 1; i >= 0; i--) {
         const pl = pls[i];
-        const wp = pl.worldPoly || (pl.pts && pl.pts.map(p => [p[0]+pl.x, p[1]+pl.y]));
+        const wp = PU.worldPolyOf(pl);
         if (!wp || wp.length < 3) continue;
         let inside = false;
         for (let ii=0, jj=wp.length-1; ii<wp.length; jj=ii++) {
@@ -18109,7 +18193,7 @@ const Measure = {
 
   // World outline of a placement (sheet mm).
   _worldPoly(pl) {
-    return pl.worldPoly || (pl.pts && pl.pts.map(p => [p[0] + pl.x, p[1] + pl.y])) || null;
+    return PU.worldPolyOf(pl);
   },
 
   // Placements on the sheet currently shown.
@@ -25966,7 +26050,7 @@ const App = {
     let hit = null;
     for (let i = placements.length - 1; i >= 0; i--) {  // top-most first
       const pl = placements[i];
-      const wp = pl.worldPoly || (pl.pts && pl.pts.map(p => [p[0]+pl.x, p[1]+pl.y]));
+      const wp = PU.worldPolyOf(pl);
       if (!wp || wp.length < 3) continue;
       // Ray-cast point in polygon
       let inside = false;
@@ -26148,7 +26232,7 @@ const App = {
       startPlY: pl.y,
       startRotation: pl.rotation || 0,
       origPts: pl.pts.map(p => [p[0], p[1]]),  // deep copy of pts at start
-      origWorldPoly: (pl.worldPoly || pl.pts.map(p => [p[0]+pl.x, p[1]+pl.y])).map(p => [p[0], p[1]]),
+      origWorldPoly: PU.worldPolyOf(pl).map(p => [p[0], p[1]]),
       origInnerLines: (pl.innerLines || []).map(il => ({
         pts: il.pts.map(p => [p[0], p[1]]),
         color: il.color, layer: il.layer, closed: il.closed,
@@ -26176,8 +26260,7 @@ const App = {
         pts: il.pts.map(p => [p[0], p[1]]),
         color: il.color, layer: il.layer, closed: il.closed,
       }));
-      const bb = polyBBox(pl.pts);
-      pl.worldPoly = pl.pts.map(p => [p[0] - bb.x + pl.x, p[1] - bb.y + pl.y]);
+      pl.worldPoly = this._usablePolyOf(pl);
     } else if (dragState.mode === 'rotate') {
       // Rotate around centroid by mouse-angle delta
       const curAngle = Math.atan2(sheetY - dragState.centroidY, sheetX - dragState.centroidX);
@@ -26206,9 +26289,22 @@ const App = {
       const bb = polyBBox(pl.pts);
       pl.x = dragState.centroidX - bb.w / 2;
       pl.y = dragState.centroidY - bb.h / 2;
-      pl.worldPoly = pl.pts.map(p => [p[0] - bb.x + pl.x, p[1] - bb.y + pl.y]);
+      pl.worldPoly = this._usablePolyOf(pl);
     }
     Renderer.draw();
+  },
+
+  /* Margin in mm (the settings field is in the display unit). */
+  _marginMM() {
+    return (parseFloat(document.getElementById('s-margin').value) || 0) * (this._unitToMM ? this._unitToMM() : 1);
+  },
+
+  /* A placement's outline in the engines' usable-area frame (sheet frame
+     minus the margin): what pl.worldPoly must hold so Improve, Phase 4
+     and replacement see a hand-moved part where it really is. */
+  _usablePolyOf(pl) {
+    const m = this._marginMM();
+    return PU.worldPolyOf(pl).map(p => [p[0] - m, p[1] - m]);
   },
 
   _endPlacementDrag(dragState) {
@@ -26219,11 +26315,12 @@ const App = {
     const settings = this.getSettings();
     const gap = settings.gap || 2;
     let invalidReason = null;
-    const aBB = polyBBox(pl.worldPoly);
+    const plWP = PU.worldPolyOf(pl);   // sheet frame, as drawn
+    const aBB = polyBBox(plWP);
 
     // Check hide outline (if any)
     if (this._sheetOutline && this._sheetOutline.length >= 3) {
-      for (const v of pl.worldPoly) {
+      for (const v of plWP) {
         if (!PU.contains(this._sheetOutline, v)) {
           invalidReason = 'outside hide outline';
           break;
@@ -26244,7 +26341,7 @@ const App = {
         if (i === this._selectedPlacementIdx) continue;
         const other = this.nestResult.placements[i];
         if (other.sheet !== pl.sheet) continue;  // different sheets can't overlap
-        const oWP = other.worldPoly || other.pts.map(p => [p[0]+other.x, p[1]+other.y]);
+        const oWP = PU.worldPolyOf(other);
         const bBB = polyBBox(oWP);
         // Bbox pre-filter with gap margin
         if (aBB.x > bBB.x + bBB.w + gap) continue;
@@ -26253,7 +26350,7 @@ const App = {
         if (aBB.y + aBB.h < bBB.y - gap) continue;
         // Inflate other by gap and test intersection
         const otherInflated = PU.offsetSingle(oWP, gap, 'square') || oWP;
-        const inter = PU.intersection([pl.worldPoly], [otherInflated]);
+        const inter = PU.intersection([plWP], [otherInflated]);
         if (inter.length > 0 && inter[0].length >= 3 && PU.area(inter[0]) > 0.5) {
           invalidReason = 'overlaps ' + (other.partName || 'another part');
           break;
@@ -26265,7 +26362,7 @@ const App = {
     if (!invalidReason && this._defects && this._defects.length) {
       for (const d of this._defects) {
         if (d.shape && d.shape.length >= 3) {
-          const inter = PU.intersection([pl.worldPoly], [d.shape]);
+          const inter = PU.intersection([plWP], [d.shape]);
           if (inter.length > 0 && inter[0].length >= 3 && PU.area(inter[0]) > 0.5) {
             invalidReason = 'overlaps defect';
             break;
@@ -26273,7 +26370,7 @@ const App = {
         } else {
           // Circle defect
           const r2 = (d.r + gap) * (d.r + gap);
-          for (const v of pl.worldPoly) {
+          for (const v of plWP) {
             const dx = v[0] - d.x, dy = v[1] - d.y;
             if (dx*dx + dy*dy < r2) { invalidReason = 'overlaps defect'; break; }
           }
@@ -26339,7 +26436,7 @@ const App = {
       _uid: 'cp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
       _copiedFrom: orig._uid,
       pts: orig.pts.map(p => [p[0], p[1]]),
-      worldPoly: (orig.worldPoly || orig.pts.map(p => [p[0]+orig.x, p[1]+orig.y])).map(p => [p[0], p[1]]),
+      worldPoly: this._usablePolyOf(orig),
       localPoly: orig.localPoly ? orig.localPoly.map(p => [p[0], p[1]]) : undefined,
       innerLines: (orig.innerLines || []).map(il => ({
         pts: il.pts.map(p => [p[0], p[1]]),
@@ -26391,7 +26488,7 @@ const App = {
       );
       // Fake remaining placed list with worldPoly entries
       const placed = remainingPlacements.map(pl => ({
-        worldPoly: pl.worldPoly || pl.pts.map(p => [p[0]+pl.x, p[1]+pl.y]),
+        worldPoly: this._usablePolyOf(pl),
         _variantKey: pl.variantKey || 'unknown',
         x: pl.nfpX != null ? pl.nfpX : pl.x,
         y: pl.nfpY != null ? pl.nfpY : pl.y,
@@ -29014,6 +29111,13 @@ const App = {
      ═════════════════════════════════════════════════════════════════ */
 
   saveProject() {
+    const payload = this._buildProjectPayload();
+    this._downloadProject(payload);
+  },
+
+  /* The whole project as one JSON-friendly object: what Save Project
+     writes and what undo/redo snapshots (src/ui/history.js). */
+  _buildProjectPayload() {
     // Snapshot current worksheet to its slot before serializing
     try { this._saveCurrentWS(); } catch (_) {}
 
@@ -29084,7 +29188,10 @@ const App = {
         try { return this.getSettings(); } catch (_) { return null; }
       })(),
     };
+    return payload;
+  },
 
+  _downloadProject(payload) {
     // Serialize and trigger download
     const json = JSON.stringify(payload, null, 0);  // compact
     const blob = new Blob([json], { type: 'application/json' });
@@ -29734,6 +29841,250 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 });
 
+</script>
+<script>
+/* ━━━━━━━━━━━━━━ INLINED FROM src/ui/history.js ━━━━━━━━━━━━━━ */
+/*
+ * NestForge Pro — Undo / redo
+ *
+ * Every operation that changes the work is undoable: importing or
+ * removing parts, quantities, renames, flips, sheet type, hide outline and
+ * defects, every kind of nesting run, moving / rotating / duplicating /
+ * deleting / replacing a placed part, worksheet changes, opening a project.
+ * Ctrl+Z undoes, Ctrl+Y or Ctrl+Shift+Z redoes; the ↶ ↷ buttons in the
+ * header do the same and their tooltips name the step.
+ *
+ * How: before an operation runs, the whole project state is snapshotted
+ * with the same serializer Save Project uses (worksheets, parts, results,
+ * rules, hide, defects, zones) plus every settings control on the right
+ * panel, and pushed on the undo stack. Undo restores a snapshot through
+ * _loadProject, keeping the current zoom and pan. Operations that turn out
+ * to change nothing (an import that was cancelled, a click that did not
+ * move a part) leave no step: a snapshot identical to the current state is
+ * dropped when undo reaches it.
+ *
+ * The operations are wrapped by name in History.install(), so the app's
+ * own methods stay untouched.
+ *
+ * This file is loaded by index.html as a plain <script> tag — no module
+ * system. It must come after app.js (it wraps App's methods) and runs
+ * install() on DOMContentLoaded.
+ */
+
+const History = {
+  undoStack: [],
+  redoStack: [],
+  LIMIT: 60,
+  _busy: false,        // true while restoring: wrapped methods must not record
+
+  // Operation → step name shown in the tooltip. Methods are looked up on
+  // App at install time; a missing one is skipped.
+  OPS: [
+    ['loadFiles',                    'import parts'],
+    ['_loadProject',                 'open project'],
+    ['renamePart',                   'rename part'],
+    ['flipPart',                     'flip part'],
+    ['changeQty',                    'change quantity'],
+    ['removePart',                   'remove part'],
+    ['clearAll',                     'clear all'],
+    ['_onSheetTypeChange',           'change sheet type'],
+    ['_onLeatherGradeChange',        'change leather grade'],
+    ['_onLeatherDimChange',          'change hide size'],
+    ['_regenerateDefects',           'regenerate defects'],
+    ['_onDefectClick',               'edit defect'],
+    ['_importCustomSheet',           'import custom sheet'],
+    ['confirmAutoSize',              'auto-size sheet'],
+    ['_runNestingProceed',           'nest'],
+    ['runAdvancedNesting',           'advanced nesting'],
+    ['tryImprove',                   'improve'],
+    ['_beginPlacementDrag',          'move part'],
+    ['_duplicatePlacement',          'duplicate part'],
+    ['flipSelectedPlacement',        'flip placed part'],
+    ['replaceDeleteSelected',        'delete placed part'],
+    ['_performReplacement',          'replace part'],
+    ['addWorksheet',                 'add sheet'],
+    ['removeWorksheet',              'remove sheet'],
+    ['mergeSelectedSheets',          'merge sheets'],
+  ],
+
+  install() {
+    for (const [name, label] of this.OPS) {
+      const orig = App[name];
+      if (typeof orig !== 'function') continue;
+      App[name] = function (...args) {
+        // A duplicate-drag records once, as "duplicate part"
+        if (!(name === '_beginPlacementDrag' && args[2])) History.record(label);
+        return orig.apply(this, args);
+      };
+    }
+    // An import is one step however many files it has: the step is taken
+    // when the files arrive (loadFiles), and nothing records while the
+    // import's own sheet creation and per-file confirmations run.
+    if (typeof App._chooseSheet === 'function') {
+      const orig = App._chooseSheet;
+      App._chooseSheet = function (...args) {
+        History._inImport = true;
+        try { return orig.apply(this, args); } finally { History._inImport = false; }
+      };
+    }
+    // Norm Calculator "Apply to Canvas" lives in its own module
+    if (typeof LeatherNorm !== 'undefined' && typeof LeatherNorm.applyToCanvas === 'function') {
+      const orig = LeatherNorm.applyToCanvas;
+      LeatherNorm.applyToCanvas = function (...args) { History.record('apply norm sheet'); return orig.apply(this, args); };
+    }
+    window.addEventListener('keydown', (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      const k = e.key.toLowerCase();
+      if (k === 'z' && !e.shiftKey) { e.preventDefault(); this.undo(); }
+      else if (k === 'y' || (k === 'z' && e.shiftKey)) { e.preventDefault(); this.redo(); }
+    });
+    this._updateButtons();
+  },
+
+  // ── snapshots ─────────────────────────────────────────────────────────
+  // Everything Save Project writes, plus the live settings controls and a
+  // few view-independent bits of state the serializer leaves out.
+  snapshot() {
+    const payload = App._buildProjectPayload();
+    const controls = {};
+    for (const el of document.querySelectorAll('#right-panel input[id], #right-panel select[id]')) {
+      controls[el.id] = (el.type === 'checkbox' || el.type === 'radio') ? !!el.checked : el.value;
+    }
+    return structuredClone({
+      payload, controls,
+      rulesMode: App._rulesMode || null,
+      sheetSetByNormCalc: !!App._sheetSetByNormCalc,
+      normCalcDecoration: Renderer.normCalcDecoration || null,
+      currentSheet: Renderer.currentSheet || 0,
+      fillSheetMode: !!App._fillSheetMode,
+    });
+  },
+
+  // Two snapshots are the same work if their serializations match; the
+  // save timestamp is left out of the comparison.
+  _key(snap) {
+    const p = Object.assign({}, snap.payload, { __savedAt: null });
+    return JSON.stringify(Object.assign({}, snap, { payload: p }));
+  },
+
+  // True while an import is still being confirmed file by file.
+  importInProgress() {
+    return !!(this._inImport || App._pendingFiles || App._pendingImport
+      || (App._importQueue && App._importQueue.length)
+      || (App._worksheets && App._worksheets.some(ws => ws._pendingImportFile)));
+  },
+
+  record(label) {
+    if (this._busy || this.importInProgress()) return;
+    try {
+      this.undoStack.push({ label, snap: this.snapshot() });
+      if (this.undoStack.length > this.LIMIT) this.undoStack.shift();
+      this.redoStack.length = 0;
+      this._updateButtons();
+    } catch (e) {
+      console.warn('[History] snapshot failed, step not recorded:', e);
+    }
+  },
+
+  restore(snap) {
+    this._busy = true;
+    const view = { zoom: Renderer.zoom, offsetX: Renderer.offsetX, offsetY: Renderer.offsetY };
+    try {
+      if (typeof App.replaceCancelSelection === 'function') App.replaceCancelSelection();
+      if (typeof Measure !== 'undefined') { Measure.pending = null; Measure.hover = null; }
+      App._loadProject(structuredClone(snap.payload));
+      // Every settings control, restored silently (no change events: those
+      // would regenerate outlines and defects), then the bits of UI that
+      // depend on them.
+      for (const [id, v] of Object.entries(snap.controls || {})) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        if (el.type === 'checkbox' || el.type === 'radio') el.checked = !!v; else el.value = v;
+      }
+      const flowOn = document.getElementById('flow-enable').checked;
+      document.getElementById('flow-options').style.display = flowOn ? 'block' : 'none';
+      document.getElementById('btn-flow').classList.toggle('flow-on', flowOn);
+      App._updateFlowPills && App._updateFlowPills();
+      const st = document.getElementById('s-sheet-type');
+      if (st) {
+        const isLeather = st.value !== 'rectangle' && st.value !== 'custom';
+        const isCustom = st.value === 'custom';
+        const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none'; };
+        show('leather-grade-row', isLeather);
+        show('leather-defect-row', isLeather || isCustom);
+        show('leather-custom-row', isCustom);
+        show('leather-zones-row', isLeather);
+      }
+      App._rulesMode = snap.rulesMode || null;
+      App._sheetSetByNormCalc = !!snap.sheetSetByNormCalc;
+      App._fillSheetMode = !!snap.fillSheetMode;
+      Renderer.normCalcDecoration = snap.normCalcDecoration || null;
+      Renderer.currentSheet = snap.currentSheet || 0;
+      // Sheet size from the restored controls (the project payload only
+      // carries it in mm; the controls are in the display unit).
+      const u = App._unitToMM ? App._unitToMM() : 1;
+      Renderer.sheetW = (parseFloat(document.getElementById('s-width').value) || Renderer.sheetW / u) * u;
+      Renderer.sheetH = (parseFloat(document.getElementById('s-height').value) || Renderer.sheetH / u) * u;
+      App._refreshAreaDisplay && App._refreshAreaDisplay();
+      App.updateUI && App.updateUI();
+      if (App.nestResult && App.nestResult.sheets) App.renderSheetTabs(App.nestResult.sheets);
+    } finally {
+      Renderer.zoom = view.zoom; Renderer.offsetX = view.offsetX; Renderer.offsetY = view.offsetY;
+      const zv = document.getElementById('zoom-val'); if (zv) zv.textContent = Math.round(view.zoom * 100) + '%';
+      Renderer.draw();
+      this._busy = false;
+    }
+  },
+
+  undo() {
+    if (!this.undoStack.length) return false;
+    const now = this.snapshot();
+    const nowKey = this._key(now);
+    // Drop steps that changed nothing
+    let step = null;
+    while (this.undoStack.length) {
+      const s = this.undoStack.pop();
+      if (this._key(s.snap) !== nowKey) { step = s; break; }
+    }
+    if (!step) { this._updateButtons(); return false; }
+    this.redoStack.push({ label: step.label, snap: now });
+    this.restore(step.snap);
+    this._status('Undid: ' + step.label);
+    this._updateButtons();
+    return true;
+  },
+
+  redo() {
+    if (!this.redoStack.length) return false;
+    const step = this.redoStack.pop();
+    this.undoStack.push({ label: step.label, snap: this.snapshot() });
+    this.restore(step.snap);
+    this._status('Redid: ' + step.label);
+    this._updateButtons();
+    return true;
+  },
+
+  _status(msg) {
+    const el = document.getElementById('nest-status');
+    if (el) el.textContent = msg;
+  },
+
+  _updateButtons() {
+    const u = document.getElementById('btn-undo'), r = document.getElementById('btn-redo');
+    if (u) {
+      u.disabled = !this.undoStack.length;
+      u.title = this.undoStack.length ? 'Undo: ' + this.undoStack[this.undoStack.length - 1].label + ' (Ctrl+Z)' : 'Nothing to undo (Ctrl+Z)';
+    }
+    if (r) {
+      r.disabled = !this.redoStack.length;
+      r.title = this.redoStack.length ? 'Redo: ' + this.redoStack[this.redoStack.length - 1].label + ' (Ctrl+Y)' : 'Nothing to redo (Ctrl+Y)';
+    }
+  },
+};
+
+document.addEventListener('DOMContentLoaded', () => History.install());
 </script>
 <!-- main.js skipped (duplicate of app.js DOMContentLoaded) -->
 

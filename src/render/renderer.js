@@ -55,7 +55,7 @@ const Renderer = {
       const pls = App.nestResult.placements;
       for (let i = pls.length - 1; i >= 0; i--) {
         const pl = pls[i];
-        const wp = pl.worldPoly || (pl.pts && pl.pts.map(p => [p[0]+pl.x, p[1]+pl.y]));
+        const wp = PU.worldPolyOf(pl);
         if (!wp || wp.length < 3) continue;
         let inside = false;
         for (let ii=0, jj=wp.length-1; ii<wp.length; jj=ii++) {

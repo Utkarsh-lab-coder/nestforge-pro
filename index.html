@@ -26,6 +26,8 @@
   <button class="header-btn mobile-hide" onclick="App.openZip()" title="Import ZIP file">🗜 ZIP</button>
   <button class="header-btn mobile-hide" onclick="App.openProjectFile()" title="Open a saved .nfp project file">📁 Open Project</button>
   <button class="header-btn mobile-hide" onclick="App.saveProject()" title="Save all parts, sheets, settings & rules to .nfp project file">💾 Save Project</button>
+  <button class="header-btn mobile-hide" id="btn-undo" onclick="History.undo()" title="Nothing to undo (Ctrl+Z)" disabled>↶</button>
+  <button class="header-btn mobile-hide" id="btn-redo" onclick="History.redo()" title="Nothing to redo (Ctrl+Y)" disabled>↷</button>
   <button class="header-btn primary mobile-hide" id="btn-nest" onclick="App.runNesting()" disabled>▶ Run Nesting</button>
   <button class="header-btn mobile-hide" id="btn-advanced" onclick="App.runAdvancedNesting()" disabled title="GA-based deep search: generates 6+ candidate layouts with different random seeds, picks best, then polishes. Takes 2-3 minutes. Won't replace your current result unless strictly better.">🧬 Run Advanced Nesting</button>
   <button class="header-btn mobile-hide" id="btn-improve" onclick="App.tryImprove()" disabled title="Add more parts to current layout in empty gaps (like manual placement, automated). Keeps all existing placements.">🔄 Improve</button>
@@ -938,6 +940,7 @@
 <script src="src/ui/worksheet-manager.js"></script>
 <script src="src/nesting/leather-norm.js"></script>
 <script src="src/ui/app.js"></script>
+<script src="src/ui/history.js"></script>
 <!-- main.js skipped (duplicate of app.js DOMContentLoaded) -->
 
 </body>

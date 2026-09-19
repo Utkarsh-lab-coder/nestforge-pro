@@ -2733,7 +2733,7 @@ const PolyNestEngine = {
      "Fits at rowY" means: skyline-fit Y must be ≤ rowY. If skyline has concave
      space below rowY at this X (e.g. from a shorter part placed here earlier),
      the actual placement Y can be < rowY — part slots down naturally.       */
-  placeInRowStrict(variantsWithContours, skyline, sheetW, sheetH, rowY, minX) {
+  placeInRowStrict(variantsWithContours, skyline, sheetW, sheetH, rowY, minX, okAt) {
     let best = null;
     const STEP = 1;
 
@@ -2743,13 +2743,23 @@ const PolyNestEngine = {
       const xMax = sheetW - bboxW;
       if (minX > xMax + 1e-6) continue;
       if (rowY + bboxH > sheetH + 1e-6) continue;
+      // On a hide (okAt given) a row is a band: where the hide's edge
+      // curves away, a part may sit lower than the baseline, up to three
+      // quarters of its height, so the rows follow the hide instead of
+      // stopping at its first dip.
+      const yMax = rowY + (okAt ? bboxH * 0.75 : 0);
 
       let foundX = -1, foundY = -1;
       for (let x = Math.max(0, Math.floor(minX)); x <= Math.ceil(xMax); x += STEP) {
-        const y = this.skyFit(bot, skyline, x, contourW, sheetH, bboxH);
+        let y = this.skyFit(bot, skyline, x, contourW, sheetH, bboxH);
         if (y < 0) continue;
         // Must fit AT or BELOW row baseline
         if (y > rowY + 1e-6) continue;
+        if (okAt) {
+          // Drop until the whole part is on the hide and off the defects
+          while (y <= yMax + 1e-6 && y + bboxH <= sheetH + 1e-6 && !okAt(v, x, y)) y += 2;
+          if (y > yMax + 1e-6 || y + bboxH > sheetH + 1e-6) continue;
+        }
         foundX = x; foundY = y;
         break;
       }
@@ -2771,7 +2781,7 @@ const PolyNestEngine = {
      using the skyline. The row alternation for flow mode is handled by the
      caller choosing which variants (rotA vs rotB) to pass in. This allows parts
      to naturally fill concave dead space between parts of the previous row.  */
-  placeSky(variantsWithContours, skyline, sheetW, sheetH) {
+  placeSky(variantsWithContours, skyline, sheetW, sheetH, okAt) {
     let best = null;
     const STEP = 1;
 
@@ -2783,8 +2793,14 @@ const PolyNestEngine = {
 
       let variantBestY = Infinity, variantBestX = -1;
       for (let x = 0; x <= Math.ceil(xMax); x += STEP) {
-        const y = this.skyFit(bot, skyline, x, contourW, sheetH, bboxH);
+        let y = this.skyFit(bot, skyline, x, contourW, sheetH, bboxH);
         if (y < 0) continue;
+        if (okAt) {
+          // Hide: drop a little way looking for a spot on the hide
+          const yStop = y + 40;
+          while (y <= yStop && y + bboxH <= sheetH + 1e-6 && !okAt(v, x, y)) y += 2;
+          if (y > yStop || y + bboxH > sheetH + 1e-6) continue;
+        }
         // Prefer min Y; tie-break by min X
         if (y < variantBestY - 1e-6) {
           variantBestY = y;
@@ -2904,6 +2920,57 @@ const PolyNestEngine = {
     const skyW = Math.ceil(usW) + 2;
     const skyline = new Float64Array(skyW);
 
+    // ── Hide outline and defects ─────────────────────────────────────
+    // The lane placer is skyline-only; it knew nothing about a hide, so
+    // Cutting Flow on leather could put parts off the hide and on defects
+    // (the raster flow always had its obstacle mask). Now: a 1 mm mask of
+    // forbidden cells (outside the outline, on a defect) built by the same
+    // code the raster engine uses, sampled along each part's outline at
+    // every candidate, and the exact polygon tests confirm the spot found.
+    let okAt = null;
+    const hasHide = !!(settings.sheetOutline && settings.sheetOutline.length >= 3);
+    const hasDefects = !!(settings.defects && settings.defects.length);
+    if ((hasHide || hasDefects) && typeof NestEngineRaster !== 'undefined') {
+      const MW = Math.ceil(usW) + 1, MH = Math.ceil(usH) + 1;
+      const mask = NestEngineRaster._buildObstacleMask(settings, MW, MH, 1);
+      // Defects grown by 1 mm for the exact test: the variant outline is the
+      // cleaned polygon, which can sit a fraction of a millimetre inside the
+      // raw one, so a bare test could leave the cut edge on a defect.
+      const defectsGrown = hasDefects ? settings.defects.map(d => (d.shape && d.shape.length >= 3)
+        ? { ...d, r: (d.r || 0) + 1, shape: PU.offsetSingle(d.shape, 1, 'square') || d.shape }
+        : { ...d, r: (d.r || 0) + 1 }) : null;
+      // Outline sample points per variant: every vertex plus a point every
+      // 4 mm along each edge, relative to the variant's origin.
+      const samplesOf = (v) => {
+        if (v._hideSamples) return v._hideSamples;
+        const out = [];
+        const pts = v.pts;
+        for (let i = 0; i < pts.length; i++) {
+          const a = pts[i], b = pts[(i + 1) % pts.length];
+          const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+          const n = Math.max(1, Math.ceil(len / 4));
+          for (let k = 0; k < n; k++) {
+            const t = k / n;
+            out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+          }
+        }
+        v._hideSamples = out;
+        return out;
+      };
+      okAt = (v, x, y) => {
+        if (mask) {
+          for (const [sx, sy] of samplesOf(v)) {
+            const gx = Math.floor(sx + x), gy = Math.floor(sy + y);
+            if (gx < 0 || gy < 0 || gx >= MW || gy >= MH || mask[gy * MW + gx]) return false;
+          }
+        }
+        const world = PU.translate(v.pts, x, y);
+        if (hasHide && !LeatherSheet.insideSheet(world, settings.sheetOutline)) return false;
+        if (hasDefects && LeatherSheet.overlapsDefects(world, defectsGrown)) return false;
+        return true;
+      };
+    }
+
     // Helper to commit a placement (used by both phases)
     const commitPlacement = (pl, variants, part) => {
       const v = variants[pl.vi];
@@ -2992,12 +3059,12 @@ const PolyNestEngine = {
         let variants, pl;
         if (which === 'AB') {
           const va = vcA.get(part.id), vb = vcB.get(part.id);
-          const pa = this.placeInRowStrict(va, skyline, usW, usH, rowY, curX);
-          const pb = this.placeInRowStrict(vb, skyline, usW, usH, rowY, curX);
+          const pa = this.placeInRowStrict(va, skyline, usW, usH, rowY, curX, okAt);
+          const pb = this.placeInRowStrict(vb, skyline, usW, usH, rowY, curX, okAt);
           if (pa && (!pb || pa.x <= pb.x)) { variants = va; pl = pa; } else { variants = vb; pl = pb; }
         } else {
           variants = (which === 'A' ? vcA : vcB).get(part.id);
-          pl = this.placeInRowStrict(variants, skyline, usW, usH, rowY, curX);
+          pl = this.placeInRowStrict(variants, skyline, usW, usH, rowY, curX, okAt);
         }
 
         if (pl === null) {
@@ -3063,7 +3130,7 @@ const PolyNestEngine = {
       }
 
       const variants = (useA ? vcA : vcB).get(part.id);
-      const pl = this.placeSky(variants, skyline, usW, usH);
+      const pl = this.placeSky(variants, skyline, usW, usH, okAt);
 
       if (pl === null) {
         phase2Step++;

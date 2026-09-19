@@ -62,6 +62,21 @@ const PU = {  // PolyUtils
     return pts.map(([x, y]) => [x + dx, y + dy]);
   },
 
+  /* The outline of a placed part in SHEET coordinates, exactly as it is
+     drawn: a placement's (x, y) is where the part's bounding-box corner
+     sits (margin included) and its pts are the rotated / mirrored outline
+     as rotated about the origin, so the outline is moved by
+     (x - bbox.minX, y - bbox.minY). Always computed from pts: the engines'
+     pl.worldPoly is in USABLE-AREA coordinates (no margin) and is theirs;
+     UI code (hit tests, dragging, measuring) must use this one. */
+  worldPolyOf(pl) {
+    if (!pl.pts || pl.pts.length < 3) return null;
+    let minX = Infinity, minY = Infinity;
+    for (const p of pl.pts) { if (p[0] < minX) minX = p[0]; if (p[1] < minY) minY = p[1]; }
+    const dx = pl.x - minX, dy = pl.y - minY;
+    return pl.pts.map(p => [p[0] + dx, p[1] + dy]);
+  },
+
   rotate(pts, deg, cx = 0, cy = 0) {
     const r = deg * Math.PI / 180;
     const c = Math.cos(r), s = Math.sin(r);

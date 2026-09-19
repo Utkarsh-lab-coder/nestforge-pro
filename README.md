@@ -29,7 +29,13 @@ and the lane layout is always the result: it is never swapped for a tighter free
 that direction it tries every way of sequencing the lanes (the two rotations alternating along a
 row or by whole rows, parts tucked into the cavity of the one before or not, odd rows offset by
 half a part), 28 layouts, and keeps the fullest; the status line names the winner. The "Auto"
-direction widens the search to eight angles across horizontal and vertical lanes.
+direction widens the search to eight angles across horizontal and vertical lanes. On a hide the
+lanes stay on the hide and off the defects, and follow the hide's edge.
+
+**Undo / redo.** Every operation is a step: importing or removing parts, quantities, renames,
+flips, sheet type, hide and defects, every kind of nesting run, moving, rotating, duplicating,
+deleting or replacing a placed part, worksheet changes, opening a project. Ctrl+Z / Ctrl+Y, or
+the ↶ ↷ buttons, whose tooltips name the step. A multi-file import is one step.
 
 **Measure tool.** A ruler on the canvas, in millimetres. Two clicks give a distance, snapping to
 part corners and edges and to the sheet; a click inside one part and then another gives the
@@ -131,7 +137,8 @@ src/
   render/                   colors.js, renderer.js, measure.js (the canvas ruler)
   export/                   consolidated-report.js, costing.js, export-manager.js
   import/                   auto-size.js, dxf-import.js
-  ui/                       worksheet-manager.js, and app.js (App: the interface and orchestration)
+  ui/                       worksheet-manager.js, app.js (App: the interface and orchestration),
+                            history.js (undo / redo: a project snapshot around every operation)
 vendor/
   clipper.js                Angus Johnson's Clipper 6.4.2, see THIRD-PARTY.md
   jszip.min.js              bundled export libraries, see THIRD-PARTY.md
