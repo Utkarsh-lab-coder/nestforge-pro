@@ -58,6 +58,26 @@ the Excel, PDF and ZIP libraries are bundled inside it.
 | `dist/nestforge-pro.html` | The whole app in one file, fully offline. This is what you give people. |
 | `index.html` | The same app loaded straight from `src/`. Open this while developing: edit a file, refresh, no build step. |
 
+## Sample parts
+
+`samples/` holds eight DXF parts to test with, in real footwear sizes. Each is hard for a nester in
+a different way and each exercises a different part of the DXF reader:
+
+| File | What it is | What it tests |
+|---|---|---|
+| `01_vamp_stitch_holes` | Vamp with a deep throat notch | Concave interlock; stitch lines and punch holes on other layers |
+| `02_quarter_asymmetric` | Quarter panel | Strong asymmetry, so rotation choice matters |
+| `03_heel_counter_crescent` | Crescent heel counter | Crescents nest inside each other; holes and a rounded slot |
+| `04_star_deep_concave` | Eight-point star, rounded tips | Extreme concavity; bulge arcs |
+| `05_tongue_bspline` | Tongue as a true B-spline | The spline reader (control points and knots) |
+| `06_eyestay_bulge_arcs` | S-curved eyestay | Arc-bulge polylines; six lace holes |
+| `07_welt_thin_curved` | Long thin curved strip | Thin-part gap enforcement; needs rotation to fit |
+| `08_mudguard_wavy_cutout` | Big wavy overlay with a window | 420 vertices; an internal cut-out |
+
+`make-samples.py` regenerates them. In fill mode the engine maximises the number of pieces, so a
+layout that skips the large mudguard to fit several small parts wins on count; use component rules
+with a set count when every part must appear.
+
 ## Building
 
 ```
@@ -102,6 +122,7 @@ vendor/
   jszip.min.js              bundled export libraries, see THIRD-PARTY.md
   exceljs.min.js
   jspdf.umd.min.js
+samples/                    eight test DXF parts and the script that makes them
 desktop/
   make-shortcut.ps1         creates the desktop and Start Menu shortcuts
   make-icon.py              regenerates NestForge Pro.ico and the embedded favicon
