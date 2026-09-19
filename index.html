@@ -93,6 +93,10 @@
           <polygon points="13,5 15,6.5 13,8" fill="currentColor"/>
         </svg>Flow
       </button>
+      <div class="ctb-sep"></div>
+      <button class="ctb-btn" id="btn-measure" onclick="App.toggleMeasure()"
+        title="Measure — click two points for a distance (snaps to part corners and edges), or click inside two parts for the shortest gap between them. Esc cancels / clears.">📏 Measure</button>
+      <button class="ctb-btn" id="btn-measure-clear" onclick="Measure.clear()" style="display:none" title="Remove all measurements">✕ Clear</button>
     </div>
     <!-- Sheet Tabs -->
     <div id="sheet-tabs"></div>
@@ -313,7 +317,11 @@
           <select id="flow-dir">
             <option value="horizontal">Horizontal lanes ←→  (0° ↔ 180°)</option>
             <option value="vertical">Vertical lanes  ↑↓  (90° ↔ 270°)</option>
+            <option value="auto">Auto — try 16 lane layouts, keep the fullest</option>
           </select>
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin:-4px 0 6px;line-height:1.5">
+          The chosen lanes are followed exactly, and the result is always the lane layout — never swapped for a tighter free-form nest.
         </div>
         <div class="field">
           <label>Lane Preview</label>
@@ -336,8 +344,11 @@
     <div class="section">
       <div class="section-hdr">Copies</div>
       <div class="field">
-        <label>Number of Copies</label>
+        <label>Copies of each part</label>
         <input type="number" id="s-copies" value="1" min="1" max="9999">
+      </div>
+      <div style="font-size:10px;color:var(--text3);margin:-4px 0 6px;line-height:1.5">
+        With several parts loaded this is the number of complete sets: 3 = three of every part, placed set by set.
       </div>
       <div style="margin:10px 0 4px;padding:8px 10px;background:var(--card);border:1px solid var(--border2);border-radius:4px">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--text)">
@@ -355,7 +366,11 @@
         <div style="flex:1;height:1px;background:var(--border2)"></div>
       </div>
       <button class="header-btn primary" style="width:100%;justify-content:center;font-size:13px"
+        title="Places the requested copies of every part first (complete sets), then tops up the leftover space with extra copies."
         onclick="App.fillSheet()">⬛ Fill Entire Sheet <span style="font-weight:400;opacity:0.7">(auto)</span></button>
+      <div style="font-size:10px;color:var(--text3);margin:4px 0 0;line-height:1.5">
+        Sets first, then extras: the copies above are placed as complete sets before any space is topped up.
+      </div>
     </div>
 
     <!-- Stats -->
@@ -914,6 +929,7 @@
 <script src="src/nesting/flow-strategies.js"></script>
 <script src="src/render/colors.js"></script>
 <script src="src/render/renderer.js"></script>
+<script src="src/render/measure.js"></script>
 <script src="src/export/consolidated-report.js"></script>
 <script src="src/export/costing.js"></script>
 <script src="src/export/export-manager.js"></script>

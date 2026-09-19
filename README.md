@@ -16,10 +16,23 @@ To use it, open `dist/nestforge-pro.html` in a browser. It is one self-contained
   than a pixel dilation, so precision does not depend on sheet size.
 - **Raster engine.** A grid and skyline nester. Faster per placement, and the basis for Cutting Flow.
 
-**Cutting Flow.** Lays pieces out in lanes for a clean CNC cutting path. It runs sixteen complete
-layouts, eight angles across horizontal and vertical lanes, and keeps whichever places the most
-pieces. With Cutting Flow on it also runs the polygon engine and keeps the better of the two, so
-curvy asymmetric parts such as vamps get tight interlock without anyone choosing an engine.
+**Copies are complete sets.** With several parts loaded, "Copies of each part" is the number of
+sets: 3 means three of every part. Fill Entire Sheet places those sets first, set by set, and only
+then tops up the leftover space with extras of every part, so a fill never comes back as thirteen
+of one piece and none of another. The result says how many sets are complete, which parts are
+short, and which extras were added. With "more sheets if parts overflow" on, whole sets carry
+over to the next sheet.
+
+**Cutting Flow.** Lays pieces out in lanes for a clean CNC cutting path. The lane direction chosen
+is followed exactly, horizontal lanes with pieces at 0° and 180° or vertical lanes at 90° and 270°,
+and the lane layout is always the result: it is never swapped for a tighter free-form nest. The
+"Auto" direction tries sixteen lane layouts, eight angles across horizontal and vertical lanes, and
+keeps whichever places the most pieces.
+
+**Measure tool.** A ruler on the canvas, in millimetres. Two clicks give a distance, snapping to
+part corners and edges and to the sheet; a click inside one part and then another gives the
+shortest gap between their outlines, which is how to check that the gap setting was honoured.
+Measurements stay until cleared, so several can be compared.
 
 **Rules for leather.**
 
@@ -105,7 +118,7 @@ src/
     svg-parser.js           SVG paths
   nesting/
     engine-workers.js       worker pool: runs deterministic engine jobs in parallel
-    flow-strategies.js      the 16-layout Cutting Flow search, shared by both engines
+    flow-strategies.js      Cutting Flow lane layouts and sheet overflow, shared by both engines
     rasterizer.js           rasterising polygons, gap dilation, skyline column tops
     raster-engine.js        NestEngineRaster: grid and skyline nester, Cutting Flow
     leather.js              LeatherSheet: the hide model
@@ -113,7 +126,7 @@ src/
     poly-engine.js          PolyNestEngine: the NFP nester and its optimisation phases
     engine-wrapper.js       NestEngine: chooses the raster or the polygon engine
     leather-norm.js         LeatherNorm: the norm calculator
-  render/                   colors.js, renderer.js
+  render/                   colors.js, renderer.js, measure.js (the canvas ruler)
   export/                   consolidated-report.js, costing.js, export-manager.js
   import/                   auto-size.js, dxf-import.js
   ui/                       worksheet-manager.js, and app.js (App: the interface and orchestration)

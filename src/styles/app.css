@@ -385,6 +385,7 @@ body { background: var(--bg); color: var(--text); font-family: var(--font-ui); f
 /* ── CANVAS ─────────────────────────────────────────────────── */
 #main-canvas { display: block; cursor: grab; }
 #main-canvas.panning { cursor: grabbing; }
+#main-canvas.measuring { cursor: crosshair; }
 
 /* ── RIGHT PANEL / SETTINGS ─────────────────────────────────── */
 .section { border-bottom: 1px solid var(--border2); padding: 12px 14px; }

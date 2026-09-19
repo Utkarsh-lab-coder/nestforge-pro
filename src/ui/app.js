@@ -79,6 +79,13 @@ const App = {
       document.getElementById('btn-flow').classList.toggle('flow-on', e.target.checked);
     });
     document.getElementById('flow-dir').addEventListener('change', () => this._updateFlowPills());
+    // Measure tool: Esc cancels the point in progress, then clears, then exits.
+    window.addEventListener('keydown', e => {
+      if (e.key !== 'Escape' || typeof Measure === 'undefined' || !Measure.active) return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      if (Measure.onEscape()) e.preventDefault();
+    });
     // Auto-size modal: update estimate when dimension/lock changes
     document.getElementById('as-lock-dim').addEventListener('change', () => this._updateAutoSizeLabels());
     document.getElementById('as-dim-val').addEventListener('input', () => this._updateAutoSizeEstimate());
@@ -2816,57 +2823,30 @@ const App = {
           'Note: Flow mode disabled — zone rules require standard nesting';
       }
       // ── ENGINE SELECTION ──────────────────────────────────────────
-      // Cutting Flow ON: run BOTH the flow (lane) engine AND the polygon
-      // NFP engine, then keep whichever placed more parts. Flow gives a
-      // clean CNC lane path; NFP gives tight cavity interlock. For curvy
-      // asymmetric parts (vamps) NFP usually wins; for rectangular-ish
-      // parts flow often ties, so the user gets the best of both without
-      // choosing. Cutting Flow OFF: just the polygon NFP engine.
+      // Cutting Flow ON: the lane layout IS the result. This used to run
+      // the free-form NFP engine as well and keep whichever placed more,
+      // so on a PC where the lane engine placed a few parts fewer the user
+      // got a scattered layout with Cutting Flow switched on. The lanes
+      // were asked for; they are what comes back. The NFP engine is only a
+      // fallback when the lane engine places nothing at all (or fails).
+      // Cutting Flow OFF: just the polygon NFP engine.
       let nestFn;
       if (settings.cuttingFlow) {
         nestFn = async function(partDefs, s, onProgress, isCancelled, onPlacement) {
-          const quiet = () => {};
-          // Phase 1: Cutting Flow (multi-strategy, lanes)
-          onProgress(0, 'Cutting Flow — trying lane layouts…');
           let flowRes = null;
           try {
             flowRes = await NestEngine.flowNest.call(
               NestEngine, partDefs, s,
-              (p, m) => onProgress(p * 0.5, 'Flow: ' + m),
-              isCancelled, quiet);
-          } catch (e) { console.warn('[BestOfBoth] flow engine error:', e); }
+              (p, m) => onProgress(p, 'Cutting Flow: ' + m),
+              isCancelled, onPlacement);
+          } catch (e) { console.warn('[CuttingFlow] flow engine error:', e); }
           if (isCancelled && isCancelled()) return flowRes;
-          // Phase 2: Polygon NFP (tight interlock)
-          onProgress(0.5, 'Polygon NFP — trying tight interlock…');
-          let nfpRes = null;
-          try {
-            nfpRes = await NestEngine.nest.call(
-              NestEngine, partDefs, s,
-              (p, m) => onProgress(0.5 + p * 0.5, 'NFP: ' + m),
-              isCancelled, quiet);
-          } catch (e) { console.warn('[BestOfBoth] nfp engine error:', e); }
-          const flowPlaced = flowRes ? (flowRes.placed || 0) : 0;
-          const nfpPlaced  = nfpRes  ? (nfpRes.placed  || 0) : 0;
-          // Prefer NFP on a tie — it's the tighter, machine-agnostic layout.
-          const nfpWins = nfpPlaced >= flowPlaced;
-          const winner = nfpWins ? (nfpRes || flowRes) : (flowRes || nfpRes);
-          const winnerName = nfpWins ? 'Polygon NFP' : 'Cutting Flow';
-          console.log('[BestOfBoth] Cutting Flow placed=' + flowPlaced +
-            ', Polygon NFP placed=' + nfpPlaced + ' \u2192 winner: ' + winnerName);
-          // Replay the winner's placements through the real live-preview
-          // callback so the canvas shows the chosen layout as it "lands".
-          if (onPlacement && winner && winner.placements) {
-            for (let i = 0; i < winner.placements.length; i++) {
-              try {
-                onPlacement({
-                  placement: winner.placements[i],
-                  totalPlaced: i + 1,
-                  sheetIdx: winner.placements[i].sheet || 0
-                });
-              } catch (_) {}
-            }
-          }
-          return winner;
+          if (flowRes && flowRes.placed > 0) return flowRes;
+          console.warn('[CuttingFlow] lane engine placed nothing - falling back to polygon NFP');
+          const el = document.getElementById('prog-sub');
+          if (el) el.textContent = 'Cutting Flow placed nothing - using standard nesting';
+          return await NestEngine.nest.call(NestEngine, partDefs, s,
+            (p, m) => onProgress(p, 'NFP: ' + m), isCancelled, onPlacement);
         };
       } else {
         nestFn = NestEngine.nest;
@@ -3050,6 +3030,7 @@ const App = {
 
       let bestResult = null;
       let bestScore = { sets: -1, util: 0 };
+      let nestDefCount = this.parts.length;   // part definitions handed to the engine (after must-mirror expansion)
 
       // ── Progressive rendering setup ──────────────────────────────
       // Before nesting starts, set up a live-updating result object that
@@ -3134,6 +3115,7 @@ const App = {
             this._applyComponentRules(p, settings.rotations, settings.mirrorMode)
           );
           const partsForNest = this._expandForMustMirror(partsForNestRaw, settings.mirrorMode);
+          nestDefCount = partsForNest.length;
           thisResult = await nestFn.call(NestEngine,
             partsForNest, settings, onProgress, () => this._cancelled, onPlacement
           );
@@ -3217,6 +3199,7 @@ const App = {
         );
         // Expand must-mirror parts into alternating original+flipped pairs
         const partsForNest = this._expandForMustMirror(partsForNestRaw, settings.mirrorMode);
+        nestDefCount = partsForNest.length;
         // Reset live placements for each auto-grow attempt
         liveResult.placements = [];
         liveResult.placed = 0;
@@ -3278,9 +3261,12 @@ const App = {
         }
         // Restore fillSheet=false for status display consistency
         settings.fillSheet = false;
-        // Cap result.placements to user's requested copies count
-        if (result.placements.length > _autoExpandTargetCopies) {
-          result.placements = result.placements.slice(0, _autoExpandTargetCopies);
+        // Cap result.placements to the requested copies OF EACH PART. This
+        // used to cap at `copies` in total, which cut a 3-copies nest of 8
+        // parts down to 3 parts.
+        const autoExpandMax = _autoExpandTargetCopies * Math.max(1, nestDefCount);
+        if (result.placements.length > autoExpandMax) {
+          result.placements = result.placements.slice(0, autoExpandMax);
           result.placed = result.placements.length;
           result.unplaced = 0;
         }
@@ -3327,11 +3313,21 @@ const App = {
         const sheetTag = (result.sheetCount > 1)
           ? `  •  📑 ${result.sheetCount} sheets`
           : '';
-        const unplacedTag = result.unplaced > 0
+        let setsTag = '';
+        let unplacedTag = result.unplaced > 0
           ? `  •  ⚠ ${result.unplaced} too wide for sheet (increase Width)`
           : '';
+        if (result.sets) {
+          const S = result.sets;
+          setsTag = S.complete >= S.requested
+            ? `  •  🎯 ${S.complete} of ${S.requested} sets complete`
+            : `  •  ⚠ only ${S.complete} of ${S.requested} sets fit`;
+          unplacedTag = result.unplaced > 0
+            ? `  •  ${result.unplaced} part(s) of the requested sets did not fit (larger sheet or more sheets)`
+            : '';
+        }
         document.getElementById('nest-status').textContent =
-          `✓ ${result.placed} placed${sheetTag}${grewTag}${unplacedTag}${flowTag}${engineTag}`;
+          `✓ ${result.placed} placed${setsTag}${sheetTag}${grewTag}${unplacedTag}${flowTag}${engineTag}`;
         Renderer.fitView();
         this._saveCurrentWS();
       }
@@ -3415,7 +3411,31 @@ const App = {
     // ── SET stats (if any component has setCount > 0) ─────────────────
     let setsTag = '';
     const setsBox = document.getElementById('st-sets-box');
-    if (this._componentRules) {
+    if (result.sets) {
+      // Copies-as-sets: one of every part per set. Count per part name so
+      // the user can see exactly which part is short.
+      const S = result.sets;
+      const perName = new Map((S.perPart || []).map(r => [r.name, r.placed]));
+      const short = [], extras = [];
+      for (const [name, n] of perName) {
+        if (n < S.requested) short.push(`${S.requested - n}× ${name}`);
+        else if (n > S.requested) extras.push(`${n - S.requested}× ${name}`);
+      }
+      setsTag = `\n🎯 Complete sets: ${S.complete} of ${S.requested}` +
+                (short.length ? ` • Missing: ${short.join(', ')}` : '') +
+                (extras.length ? ` • Extras: ${extras.join(', ')}` : '');
+      if (setsBox) {
+        setsBox.style.display = '';
+        document.getElementById('st-sets-count').textContent = `${S.complete} / ${S.requested}`;
+        const breakdown = [...perName].map(([name, n]) => `${name}: ${n} of ${S.requested}` +
+          (n < S.requested ? '  ✗' : n > S.requested ? `  (+${n - S.requested} extra)` : '  ✓')).join('\n');
+        let detail = `1 set = one of each of the ${S.partsPerSet} loaded parts\n${breakdown}`;
+        if (short.length) detail += `\n\n${S.requested - S.complete} set(s) did not fit. Missing: ${short.join(', ')}.\nUse a larger sheet, more sheets, or fewer copies.`;
+        else if (extras.length) detail += `\n\nAll ${S.requested} sets placed; the leftover space holds extras: ${extras.join(', ')}.`;
+        else detail += `\n\nAll ${S.requested} sets placed, no extras.`;
+        document.getElementById('st-sets-detail').textContent = detail;
+      }
+    } else if (this._componentRules) {
       const setCounts = new Map();
       for (const [key, rule] of this._componentRules) {
         if (rule && rule.setCount > 0) setCounts.set(key, rule.setCount);
@@ -3600,9 +3620,30 @@ const App = {
     cb.dispatchEvent(new Event('change'));
   },
 
+  /* Measure tool on the canvas (src/render/measure.js). Measurements made
+     while it is on stay drawn after it is switched off, until cleared. */
+  toggleMeasure(force) {
+    const on = (typeof force === 'boolean') ? force : !Measure.active;
+    Measure.active = on;
+    Measure.pending = null;
+    Measure.hover = null;
+    document.getElementById('btn-measure').classList.toggle('active', on);
+    document.getElementById('btn-measure-clear').style.display = (on || Measure.items.length) ? '' : 'none';
+    document.getElementById('main-canvas').classList.toggle('measuring', on);
+    if (on) {
+      // Measuring and part selection do not mix: drop any selection
+      if (typeof this.replaceCancelSelection === 'function') this.replaceCancelSelection();
+      document.getElementById('nest-status').textContent =
+        '📏 Measure: click two points (snaps to corners and edges), or click inside two parts for the gap between them. Esc cancels / clears.';
+    } else if (!Measure.items.length) {
+      document.getElementById('nest-status').textContent = this.nestResult ? 'Ready' : document.getElementById('nest-status').textContent;
+    }
+    Renderer.draw();
+  },
+
   _updateFlowPills() {
     const dir = document.getElementById('flow-dir').value;
-    const [a, b] = dir === 'vertical' ? ['90°','270°'] : ['0°','180°'];
+    const [a, b] = dir === 'vertical' ? ['90°','270°'] : dir === 'auto' ? ['?','?'] : ['0°','180°'];
     document.getElementById('flow-pill-a').textContent = a;
     document.getElementById('flow-pill-b').textContent = b;
     document.getElementById('flow-pill-a2').textContent = a;

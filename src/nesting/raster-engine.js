@@ -202,11 +202,50 @@ const NestEngineRaster = {
         if (rule && rule.setCount > 0) setCounts.set(key, rule.setCount);
       }
     }
-    const setMode = setCounts.size > 0;
+    // Copies = complete sets (see poly-engine for the full note): with several
+    // parts, "3 copies" is 3 of each; on a filled or fixed sheet the queue is
+    // built set by set, extras (Fill mode) after the last set.
+    const derivedSets = setCounts.size === 0 && copies >= 1 && partDefs.length >= 2
+                        && (fillSheet || multiSheet) && !settings._autoExpandQueueCap
+                        && settings.setsFirst !== false;
+    const setMode = setCounts.size > 0 || derivedSets;
+    const nSetsWanted = derivedSets ? copies : 0;
+    const placedPerPart = (placements) => {
+      const byId = new Map();
+      for (const p of partDefs) byId.set(p.id, 0);
+      for (const pl of placements) if (byId.has(pl.partId)) byId.set(pl.partId, byId.get(pl.partId) + 1);
+      return partDefs.map(p => ({ id: p.id, name: p.name + (p._mustPairTag === 'mir' ? ' (mirrored)' : ''), placed: byId.get(p.id) }));
+    };
+    const countSets = (placements) => {
+      let m = Infinity;
+      for (const r of placedPerPart(placements)) if (r.placed < m) m = r.placed;
+      return m === Infinity ? 0 : m;
+    };
 
     const baseQueue = [];
     let _uid = 0;
-    if (setMode) {
+    if (derivedSets) {
+      const compKeyOf = (p) => p._componentKey || String(p.id);
+      const compArea = new Map();
+      for (const p of partDefs) {
+        const k = compKeyOf(p), a = polyArea(p.pts);
+        if (!compArea.has(k) || compArea.get(k) < a) compArea.set(k, a);
+      }
+      const setOrder = partDefs.slice().sort((a, b) => {
+        const ka = compKeyOf(a), kb = compKeyOf(b);
+        if (ka !== kb) return (compArea.get(kb) - compArea.get(ka)) || (ka < kb ? -1 : 1);
+        if (a._mustPairTag !== b._mustPairTag) return a._mustPairTag === 'orig' ? -1 : 1;
+        return (polyArea(b.pts) - polyArea(a.pts)) || (String(a.id) < String(b.id) ? -1 : 1);
+      });
+      for (let s = 0; s < nSetsWanted; s++) {
+        for (const p of setOrder) baseQueue.push({ ...p, _q: s, _uid: _uid++, _inSet: true, _setIdx: s });
+      }
+      if (fillSheet) {
+        for (let s = nSetsWanted; s < maxPerPart; s++) {
+          for (const p of setOrder) baseQueue.push({ ...p, _q: s, _uid: _uid++, _inSet: false, _exhaustFill: true });
+        }
+      }
+    } else if (setMode) {
       // Group parts by componentKey (preserves size variants as separate items)
       const byKey = new Map();
       for (const p of partDefs) {
@@ -324,9 +363,17 @@ const NestEngineRaster = {
     // Cap at 4 orderings for perf — usually enough to find a good layout.
     // In set mode, we MUST preserve the interleaved queue order so that
     // sets are completed in sequence. So we use identity (no-op) sort only.
-    const orderings = setMode
-      ? [(a,b) => 0]  // preserve insertion order (interleaved sets)
-      : orderingFns.slice(0, 4);
+    const setRank = (p) => p._inSet ? p._setIdx : 1e6 + (p._q || 0);
+    const withSetPrimary = (sortFn) => (a, b) => {
+      const ra = setRank(a), rb = setRank(b);
+      if (ra !== rb) return ra - rb;
+      return sortFn(a, b) || (a._uid - b._uid);
+    };
+    const orderings = derivedSets
+      ? orderingFns.slice(0, 3).map(withSetPrimary)
+      : setMode
+        ? [(a,b) => 0]  // preserve insertion order (interleaved sets)
+        : orderingFns.slice(0, 4);
 
     /* Inner single-pass nester — tries one specific queue ordering.       */
     const runPass = async (queue, onPassProgress) => {
@@ -367,6 +414,7 @@ const NestEngineRaster = {
       // Then continue with extras (non-set items at end of queue).
       let _abandonSets = false;
       let _currentFailedSetIdx = -1;
+      const failedExtraIds = new Set();   // copies-as-sets: one try per part for extras
 
       for (let pi = 0; pi < queue.length; pi++) {
         if (isCancelled && isCancelled()) break;
@@ -391,6 +439,10 @@ const NestEngineRaster = {
         // Reset failed-set marker when we enter a new set
         if (part._inSet && part._setIdx !== _currentFailedSetIdx) {
           _currentFailedSetIdx = -1;
+        }
+        if (part._exhaustFill && derivedSets && failedExtraIds.has(part.id)) {
+          _unplacedItems.push(part);
+          continue;
         }
 
         const variants = vc.get(part.id);
@@ -425,11 +477,13 @@ const NestEngineRaster = {
         } else {
           if (part._inSet) {
             // Set-part failed — abandon this set's remaining parts
-            _currentFailedSetIdx = part._setIdx;
-            // Also abandon ALL future sets (they won't fit if this one didn't)
+            // (copies-as-sets keeps trying the rest of the set: the smaller
+            // parts may still fit) and ALL future sets.
+            if (!derivedSets) _currentFailedSetIdx = part._setIdx;
             _abandonSets = true;
           }
-          if (fillSheet && !part._inSet) break;
+          if (part._exhaustFill && derivedSets) failedExtraIds.add(part.id);
+          else if (fillSheet && !part._inSet) break;
           _unplacedItems.push(part);
         }
       }
@@ -540,6 +594,7 @@ const NestEngineRaster = {
 
       return { placements:_allPl, placed:_placed,
                unplaced: _unplacedItems.length, unplacedItems: _unplacedItems,
+               completeSets: derivedSets ? countSets(_allPl) : 0,
                maxX:_curMaxX, maxY:_curMaxY };
     };
 
@@ -547,7 +602,8 @@ const NestEngineRaster = {
     // SIMPLIFIED: -placed*1e9 means more placed = better. Tiebreak by tighter
     // bbox. See poly-engine for full rationale on why this beats the previous
     // unplaced*1e12 weighting (set abandonment ambiguity).
-    const scorePass = (r) => -r.placed * 1e9 + r.maxX * r.maxY;
+    // Copies-as-sets: complete sets outrank the raw count.
+    const scorePass = (r) => -(r.completeSets || 0) * 1e12 - r.placed * 1e9 + r.maxX * r.maxY;
 
     // Single-sheet pass: try each ordering, keep the best.
     const singleSheetBestPass = async (queue, progressOffset, progressScale) => {
@@ -594,10 +650,13 @@ const NestEngineRaster = {
 
       remainingQueue = bestPass.unplacedItems;
       sheetIdx++;
+      if (derivedSets && remainingQueue.length && remainingQueue.every(p => p._exhaustFill)) {
+        remainingQueue = [];   // extras only top up a sheet, they never open one
+      }
 
       // Stop after one sheet if multi-sheet mode is off OR fillSheet is on
       if (!multiSheet || fillSheet) {
-        totalUnplaced = remainingQueue.length;
+        totalUnplaced = derivedSets ? remainingQueue.filter(p => !p._exhaustFill).length : remainingQueue.length;
         break;
       }
     }
@@ -606,12 +665,18 @@ const NestEngineRaster = {
       sheetsList.push({ idx: 0, placements: [] });
     }
 
-    return { placements: allPl,
+    const out = { placements: allPl,
              sheets: sheetsList,
              placed: allPl.length,
              unplaced: totalUnplaced,
              sheetCount: sheetsList.length,
              usableW:usW, usableH:usH, effRes };
+    if (derivedSets) {
+      out.sets = { requested: nSetsWanted, complete: countSets(allPl), partsPerSet: partDefs.length,
+                   perPart: placedPerPart(allPl) };
+      out.unplaced = out.sets.perPart.reduce((a, r) => a + Math.max(0, nSetsWanted - r.placed), 0);
+    }
+    return out;
   },
 
   // Cells a part may not use: outside a non-rectangular sheet (a hide) and on
@@ -980,12 +1045,17 @@ const NestEngineRaster = {
     }
 
     const totalPartArea = partDefs.reduce((s,p) => s + polyArea(p.pts), 0) || 1;
-    // AUTO-EXPAND override for flowNest: same cap-honoring as polygon engine.
-    const maxTotal = settings._autoExpandQueueCap
-      ? settings._autoExpandQueueCap
+    // Budget per part, not per sheet (same fix as the polygon flow engine):
+    // "3 copies" is 3 of EACH part; auto-expand caps each part likewise.
+    const perPart = settings._autoExpandQueueCap || copies;
+    let maxTotal = settings._autoExpandQueueCap
+      ? settings._autoExpandQueueCap * partDefs.length
       : (fillSheet
           ? Math.min(8000, Math.ceil(usW * usH / totalPartArea) + 50)
           : copies * partDefs.length);
+    // Fill mode with several parts: complete sets first (each part capped
+    // at `copies`), then the caps are lifted for extras.
+    const setsFirst = fillSheet && !settings._autoExpandQueueCap && copies >= 1 && partDefs.length >= 2;
 
     /* placeFromX — find the LEFTMOST valid placement starting at minGX.
        Unlike place() which scans the whole sheet, this advances the row
@@ -1032,7 +1102,30 @@ const NestEngineRaster = {
     let rowNum = 0;
 
     // Track how many copies of each part placed (for non-fill mode)
-    const copiesLeft = new Map(partDefs.map(p => [p.id, maxTotal]));
+    const copiesLeft = new Map(partDefs.map(p => [p.id, (fillSheet && !setsFirst) ? maxTotal : perPart]));
+    // Multi-sheet overflow (FlowStrategies.run): what is still wanted of
+    // each part after the sheets before this one.
+    if (settings._remainingById) {
+      maxTotal = 0;
+      for (const p of partDefs) { const n = settings._remainingById[p.id] | 0; copiesLeft.set(p.id, n); maxTotal += n; }
+    }
+    let capsLifted = !setsFirst;
+    // Sets first: cycle the parts biggest first, so a large part is not
+    // squeezed out of every row by the small ones that come before it in
+    // the import order. Plain copies keep the import order (cut sequence).
+    const cycle = setsFirst
+      ? partDefs.slice().sort((a, b) => polyArea(b.pts) - polyArea(a.pts) || (String(a.id) < String(b.id) ? -1 : 1))
+      : partDefs;
+    const liftCaps = () => {
+      if (capsLifted) return false;
+      capsLifted = true;
+      for (const p of partDefs) copiesLeft.set(p.id, maxTotal);
+      return true;
+    };
+    const allCapsReached = () => {
+      for (const v of copiesLeft.values()) if (v > 0) return false;
+      return true;
+    };
 
     rowLoop: while (true) {
       let curGX = 0, posInRow = 0, rowPlaced = 0;
@@ -1060,7 +1153,7 @@ const NestEngineRaster = {
         // so the tightest valid position is always chosen.
 
         const partIdx = posInRow % partDefs.length;
-        const part = partDefs[partIdx];
+        const part = cycle[partIdx];
 
         if ((copiesLeft.get(part.id) || 0) <= 0) {
           posInRow++;
@@ -1105,6 +1198,7 @@ const NestEngineRaster = {
         try { _emit({ placement, totalPlaced: placed + 1, sheetIdx: si }); } catch(_){}
 
         copiesLeft.set(part.id, (copiesLeft.get(part.id)||0) - 1);
+        if (setsFirst && !capsLifted && allCapsReached()) liftCaps();
         // CURSOR ADVANCE — Previously this jumped by the full part width
         // (pl.gx + v.w), which prevented adjacent parts from interlocking
         // into each other's concave cavities. For convex parts this is
@@ -1122,14 +1216,27 @@ const NestEngineRaster = {
         placed++;
       }
 
-      if (rowPlaced === 0) break; // no part fit anywhere — sheet full
+      if (rowPlaced === 0) {
+        // Sets-first: the rows are done with the caps on; lift them and
+        // let extras use the rest of the sheet.
+        if (liftCaps()) continue;
+        break; // no part fit anywhere — sheet full
+      }
       rowNum++;
     }
 
     sheets.push({ idx:si, placements: allPl });
-    return { placements:allPl, sheets, placed,
+    const out = { placements:allPl, sheets, placed,
              unplaced: Math.max(0, maxTotal - placed),
              sheetCount: 1, usableW:usW, usableH:usH, effRes, cuttingFlow:true };
+    if (setsFirst) {
+      const byId = new Map(partDefs.map(p => [p.id, 0]));
+      for (const pl of allPl) byId.set(pl.partId, (byId.get(pl.partId) || 0) + 1);
+      out.sets = { requested: copies, complete: Math.min(...byId.values()), partsPerSet: partDefs.length,
+        perPart: partDefs.map(p => ({ id: p.id, name: p.name + (p._mustPairTag === 'mir' ? ' (mirrored)' : ''), placed: byId.get(p.id) })) };
+      out.unplaced = Math.max(0, copies * partDefs.length - [...byId.values()].reduce((a, n) => a + Math.min(n, copies), 0));
+    }
+    return out;
   }
 };
 

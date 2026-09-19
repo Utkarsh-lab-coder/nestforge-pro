@@ -92,7 +92,33 @@ const PolyNestEngine = {
         if (rule && rule.setCount > 0) setCounts.set(key, rule.setCount);
       }
     }
-    const setMode = setCounts.size > 0;
+    // ── Copies = complete sets ─────────────────────────────────────
+    // "3 copies" of several parts means 3 complete sets: every part three
+    // times, never 13 of one and 0 of another (1 copy: one of each first). On a sheet that is filled
+    // (Fill button, hide) or fixed (multi-sheet) the queue is therefore
+    // built set by set: set 1 of every part, then set 2, ... and only after
+    // the last set any extras to top up the leftover space (Fill mode).
+    // Plain Run Nesting on a growing sheet already ends with every copy
+    // placed, so it keeps its biggest-first queue. A "Per Set" rule in the
+    // component rules keeps its own, explicit set logic below.
+    const derivedSets = setCounts.size === 0 && copies >= 1 && partDefs.length >= 2
+                        && (fillSheet || multiSheet) && !settings._autoExpandQueueCap
+                        && settings.setsFirst !== false;
+    const setMode = setCounts.size > 0 || derivedSets;
+    const nSetsWanted = derivedSets ? copies : 0;
+    // How many complete sets a list of placements holds: the smallest count
+    // of any part. This is the "N of each" the user asked for.
+    const placedPerPart = (placements) => {
+      const byId = new Map();
+      for (const p of partDefs) byId.set(p.id, 0);
+      for (const pl of placements) if (byId.has(pl.partId)) byId.set(pl.partId, byId.get(pl.partId) + 1);
+      return partDefs.map(p => ({ id: p.id, name: p.name + (p._mustPairTag === 'mir' ? ' (mirrored)' : ''), placed: byId.get(p.id) }));
+    };
+    const countSets = (placements) => {
+      let m = Infinity;
+      for (const r of placedPerPart(placements)) if (r.placed < m) m = r.placed;
+      return m === Infinity ? 0 : m;
+    };
 
     // ── Zone centers (for polygon zone check) ──────────────────────
     // Pre-compute zone centers once; _zoneCheck is set per-part before placeBest
@@ -214,7 +240,37 @@ const PolyNestEngine = {
 
     const baseQueue = [];
     let _uid = 0;
-    if (setMode) {
+    if (derivedSets) {
+      // Every part once per set, biggest component first inside a set.
+      // Must-mirror pairs (orig + mir share a component key) stay adjacent
+      // so a set holds a left and a right.
+      const compKeyOf = (p) => p._componentKey || String(p.id);
+      const compArea = new Map();
+      for (const p of partDefs) {
+        const k = compKeyOf(p), a = PU.area(p.pts);
+        if (!compArea.has(k) || compArea.get(k) < a) compArea.set(k, a);
+      }
+      const setOrder = partDefs.slice().sort((a, b) => {
+        const ka = compKeyOf(a), kb = compKeyOf(b);
+        if (ka !== kb) return (compArea.get(kb) - compArea.get(ka)) || (ka < kb ? -1 : 1);
+        if (a._mustPairTag !== b._mustPairTag) return a._mustPairTag === 'orig' ? -1 : 1;
+        return (PU.area(b.pts) - PU.area(a.pts)) || (String(a.id) < String(b.id) ? -1 : 1);
+      });
+      for (let s = 0; s < nSetsWanted; s++) {
+        for (const p of setOrder) baseQueue.push({ ...p, _q: s, _uid: _uid++, _inSet: true, _setIdx: s });
+      }
+      // Fill mode: extras after the last set, round by round (one more of
+      // every part per round) so the leftover space is topped up evenly.
+      // maxPerPart is the area-based inflation the plain fill queue uses.
+      if (fillSheet) {
+        for (let s = nSetsWanted; s < maxPerPart; s++) {
+          for (const p of setOrder) baseQueue.push({ ...p, _q: s, _uid: _uid++, _inSet: false, _exhaustFill: true });
+        }
+      }
+      console.log(`[NestForge queue] ${nSetsWanted} complete sets of ${partDefs.length} parts` +
+        (fillSheet ? ` + ${baseQueue.length - nSetsWanted * partDefs.length} extras to fill` : '') +
+        ` = ${baseQueue.length} queue`);
+    } else if (setMode) {
       const byKey = new Map();
       for (const p of partDefs) {
         const k = p._componentKey || p.id;
@@ -434,9 +490,35 @@ const PolyNestEngine = {
     // re-sort breaks that careful structure and DROPS placed count.
     // Tested: identity-only setMode gave 52 placements; introducing
     // multi-orderings dropped to 43. Keep identity.
-    const orderings = setMode
-      ? [(a, b) => 0]
-      : orderingFns.slice(0, 3);
+    //
+    // Copies-as-sets keeps the set structure (set 1, set 2, ..., extras)
+    // and only varies the order INSIDE a set: area, height or width
+    // descending, the user's sort first. Pairs and ties stay stable.
+    const setRank = (p) => p._inSet ? p._setIdx : 1e6 + (p._q || 0);
+    const withSetPrimary = (sortFn) => (a, b) => {
+      const ra = setRank(a), rb = setRank(b);
+      if (ra !== rb) return ra - rb;
+      const d = sortFn(a, b);
+      if (d !== 0) return d;
+      const ka = compKey(a), kb = compKey(b);
+      if (ka !== kb) return ka < kb ? -1 : 1;
+      const pa = pairAwareSecondary(a, b);
+      if (pa !== 0) return pa;
+      return a._uid - b._uid;
+    };
+    const setOrderingFns = {
+      area:   withSetPrimary((a, b) => PU.area(b.pts) - PU.area(a.pts)),
+      height: withSetPrimary((a, b) => PU.bbox(b.pts).h - PU.bbox(a.pts).h),
+      width:  withSetPrimary((a, b) => PU.bbox(b.pts).w - PU.bbox(a.pts).w),
+    };
+    const setOrderNames = sortBy === 'width' ? ['width', 'area', 'height']
+                        : sortBy === 'height' ? ['height', 'area', 'width']
+                        : ['area', 'height', 'width'];
+    const orderings = derivedSets
+      ? setOrderNames.map(n => setOrderingFns[n])
+      : setMode
+        ? [(a, b) => 0]
+        : orderingFns.slice(0, 3);
 
     // Shared NFP cache across ALL passes (orderings × cavity modes).
     // Key: `placedPartId|vKey||thisPartId|vKey|gap` — fully determined by the
@@ -467,6 +549,12 @@ const PolyNestEngine = {
       // Set-mode abandonment tracking (same logic as raster engine)
       let _abandonSets = false;
       let _currentFailedSetIdx = -1;
+      // Copies-as-sets: a part of a set that does not fit is simply
+      // unplaced (the retry passes get another go at it); the rest of its
+      // set still runs, since the smaller parts may well fit. Later sets
+      // are still abandoned. An extra of a part that already failed is not
+      // tried again in this loop: the sheet only gets fuller.
+      const failedExtraIds = new Set();
 
       for (let pi = 0; pi < queue.length; pi++) {
         if (isCancelled && isCancelled()) break;
@@ -490,6 +578,10 @@ const PolyNestEngine = {
         }
         if (part._inSet && part._setIdx !== _currentFailedSetIdx) {
           _currentFailedSetIdx = -1;
+        }
+        if (part._exhaustFill && derivedSets && failedExtraIds.has(part.id)) {
+          unplacedItems.push(part);
+          continue;
         }
 
         const variants = variantsByPart.get(part.id);
@@ -589,9 +681,10 @@ const PolyNestEngine = {
           // Part failed to fit on this sheet.
           // In set mode: abandon this set and all future sets (they won't fit).
           if (part._inSet) {
-            _currentFailedSetIdx = part._setIdx;
+            if (!derivedSets) _currentFailedSetIdx = part._setIdx;
             _abandonSets = true;
           }
+          if (part._exhaustFill && derivedSets) failedExtraIds.add(part.id);
           unplacedItems.push(part);
         }
       }
@@ -608,17 +701,23 @@ const PolyNestEngine = {
         };
         // Sort by area DESCENDING — try the LARGEST unplaced first.
         // Cap at 50 attempts. Each attempt is bounded by RETRY_BUDGET_MS.
+        // Copies-as-sets: the missing set parts come first (earliest set
+        // first), extras after them.
         const retryQueue = unplacedItems
           .slice()
-          .sort((a, b) => smallPartArea(b) - smallPartArea(a))
+          .sort((a, b) => (derivedSets && setRank(a) !== setRank(b))
+            ? setRank(a) - setRank(b)
+            : smallPartArea(b) - smallPartArea(a))
           .slice(0, 50);
         const stillUnplaced = [];
         let placedThisRetry = 0;
+        const retryFailedIds = new Set();   // copies-as-sets: one try per part for extras
         // Bounded by the 50-attempt cap above, not by a clock: a wall-clock
         // limit here made the layout vary from run to run (measured: the old
         // 5 s limit stopped the loop at 44-49 attempts, differently each time).
         for (const part of retryQueue) {
           if (isCancelled && isCancelled()) break;
+          if (derivedSets && part._exhaustFill && retryFailedIds.has(part.id)) { stillUnplaced.push(part); continue; }
           const variants = variantsByPart.get(part.id);
           // Set per-part zone check (used inside placeBest)
           // RETRY PASS: Zone rules remain STRICT. Unrestricted parts still
@@ -707,6 +806,7 @@ const PolyNestEngine = {
             if (bb.maxY > curMaxY) curMaxY = bb.maxY;
             placedThisRetry++;
           } else {
+            if (derivedSets && part._exhaustFill) retryFailedIds.add(part.id);
             stillUnplaced.push(part);
           }
         }
@@ -850,6 +950,7 @@ const PolyNestEngine = {
 
       return { placements: placed, placed: placed.length,
                unplaced: unplacedItems.length, unplacedItems,
+               completeSets: derivedSets ? countSets(placed) : 0,
                maxX: curMaxX, maxY: curMaxY };
     };
 
@@ -994,7 +1095,9 @@ const PolyNestEngine = {
       }
 
       const phase4Placed = [];
-      const p4Queue = unplacedItems.slice().sort((a, b) => PU.area(b.pts) - PU.area(a.pts));
+      const p4Queue = unplacedItems.slice().sort((a, b) => (derivedSets && setRank(a) !== setRank(b))
+        ? setRank(a) - setRank(b)
+        : PU.area(b.pts) - PU.area(a.pts));
       // First candidate index not yet known to fail, per (shape, rotation, rule).
       // A rejection is permanent within Phase 4 (placements are only added and
       // can only take space away), so later parts of the same shape resume the
@@ -1155,7 +1258,10 @@ const PolyNestEngine = {
     // in ways that didn't reflect actual placement quality. Direct -placed*X
     // is unambiguous: placed=46 ALWAYS beats placed=36 regardless of how
     // many other parts ended up "unplaced" due to set abandonment.
+    // Copies-as-sets: complete sets come before the raw count, so a pass
+    // with 3 of each beats one with more parts but only 2 of something.
     const scorePass = (r) =>
+      -(r.completeSets || 0) * 1e12
       -r.placed * 1e9        // dominant: more placed = much better (negative cost)
       + r.maxX * r.maxY;     // tiebreaker: tighter bbox = better
 
@@ -1227,7 +1333,9 @@ const PolyNestEngine = {
           const passLabel = `Ord${oi + 1}${cavityAware ? '+cav' : '+BL'}`;
           const score = scorePass(r);
           passResults.push({ label: passLabel, placed: r.placed, unplaced: r.unplaced, maxX: r.maxX, maxY: r.maxY, score });
-          console.log(`[NestForge pass] ${passLabel}: placed=${r.placed}, unplaced=${r.unplaced}, bbox=${Math.round(r.maxX)}×${Math.round(r.maxY)}, score=${score.toExponential(3)}`);
+          console.log(`[NestForge pass] ${passLabel}: placed=${r.placed}, unplaced=${r.unplaced}` +
+            (derivedSets ? `, sets=${r.completeSets}/${nSetsWanted}` : '') +
+            `, bbox=${Math.round(r.maxX)}×${Math.round(r.maxY)}, score=${score.toExponential(3)}`);
           if (!bestPass || score < scorePass(bestPass)) {
             bestPass = r;
             bestLabel = passLabel;
@@ -1260,6 +1368,7 @@ const PolyNestEngine = {
       if (bestPass && bestPass.unplaced > 0) {
         const beforePhase4 = bestPass.placed;
         await runPhase4(bestPass);
+        if (derivedSets) bestPass.completeSets = countSets(bestPass.placements);
         if (bestPass.placed > beforePhase4) {
           console.log(`[NestForge] Phase 4 added ${bestPass.placed - beforePhase4} parts (${beforePhase4} → ${bestPass.placed})`);
         }
@@ -1336,6 +1445,12 @@ const PolyNestEngine = {
       const inputQueue = remainingQueue;  // save reference for recovery
       remainingQueue = bestPass.unplacedItems || [];
       sheetIdx++;
+      // Copies-as-sets: extras only top up a sheet, they never open one.
+      // Once every set part is placed, leftover extras are done, not unplaced.
+      if (derivedSets && remainingQueue.length && remainingQueue.every(p => p._exhaustFill)) {
+        console.log(`[MULTI-SHEET] all ${nSetsWanted} sets placed; ${remainingQueue.length} fill extras left over`);
+        remainingQueue = [];
+      }
 
       // CRITICAL DIAGNOSTIC: if reported unplaced count > 0 but unplacedItems
       // array is empty, that's a desync bug — engine claims items are unplaced
@@ -1359,7 +1474,9 @@ const PolyNestEngine = {
       // before moving on. Previously fillSheet forced single-sheet which
       // contradicted user intent when both checkboxes were on.
       if (!multiSheet) {
-        totalUnplaced = remainingQueue.length;
+        // Copies-as-sets: only the missing set parts count as unplaced;
+        // fill extras that found no room are not parts the user asked for.
+        totalUnplaced = derivedSets ? remainingQueue.filter(p => !p._exhaustFill).length : remainingQueue.length;
         console.log(`[MULTI-SHEET] STOPPING after sheet ${sheetIdx}: multiSheet=false (single-sheet mode), remaining=${totalUnplaced} parts will be UNPLACED`);
         break;
       }
@@ -1380,7 +1497,7 @@ const PolyNestEngine = {
       sheetsList.push({ idx: 0, placements: [] });
     }
 
-    return {
+    const out = {
       placements: allPlacements,
       sheets: sheetsList,
       placed: allPlacements.length,
@@ -1388,6 +1505,16 @@ const PolyNestEngine = {
       sheetCount: sheetsList.length,
       usableW: usW, usableH: usH, effRes: 'polygon'
     };
+    if (derivedSets) {
+      // What the user asked for and what they got: N of each part. Unplaced
+      // is the shortfall against the request (an extra of a part covers a
+      // set copy of it that was skipped); fill extras are never unplaced.
+      out.sets = { requested: nSetsWanted, complete: countSets(allPlacements), partsPerSet: partDefs.length,
+                   perPart: placedPerPart(allPlacements) };
+      out.unplaced = out.sets.perPart.reduce((a, r) => a + Math.max(0, nSetsWanted - r.placed), 0);
+      console.log(`[NestForge sets] ${out.sets.complete} of ${nSetsWanted} complete sets (${partDefs.length} parts each), ${allPlacements.length} parts placed`);
+    }
+    return out;
   },
 
   /* Compute a stable hash of a polygon's shape. Parts with the same
@@ -2727,20 +2854,49 @@ const PolyNestEngine = {
     }
 
     const totalPartArea = partDefs.reduce((s, p) => s + PU.area(p.pts), 0) || 1;
-    // AUTO-EXPAND override: when caller sets _autoExpandQueueCap, use
-    // that as the absolute limit (engine stops after N placements).
-    const maxTotal = settings._autoExpandQueueCap
-      ? settings._autoExpandQueueCap
-      : (fillSheet
-          ? Math.min(8000, Math.ceil(usW * usH / totalPartArea) + 50)
-          : copies * partDefs.length);
+    // Budget per part, not per sheet: "3 copies" is 3 of EACH part. The
+    // total used to be handed to every part as its own limit, so one part
+    // could take the whole budget (13 of one, 0 of another). Auto-expand
+    // caps each part at the requested copies too.
+    const perPart = settings._autoExpandQueueCap || copies;
+    const fillTotal = Math.min(8000, Math.ceil(usW * usH / totalPartArea) + 50);
+    let maxTotal = settings._autoExpandQueueCap
+      ? settings._autoExpandQueueCap * partDefs.length
+      : (fillSheet ? fillTotal : copies * partDefs.length);
 
     const placed = [];
     let placedCount = 0;
     const t0 = performance.now();
     let lastYield = t0;
 
-    const copiesLeft = new Map(partDefs.map(p => [p.id, maxTotal]));
+    // Fill mode with several parts: the requested copies of every part are
+    // placed first as complete sets (each part capped at `copies`), then
+    // the caps are lifted and the leftover space is topped up with extras.
+    const setsFirst = fillSheet && !settings._autoExpandQueueCap && copies >= 1 && partDefs.length >= 2;
+    const copiesLeft = new Map(partDefs.map(p => [p.id, (fillSheet && !setsFirst) ? maxTotal : perPart]));
+    // Multi-sheet overflow (FlowStrategies.run): this sheet gets what is
+    // still wanted of each part after the sheets before it.
+    if (settings._remainingById) {
+      maxTotal = 0;
+      for (const p of partDefs) { const n = settings._remainingById[p.id] | 0; copiesLeft.set(p.id, n); maxTotal += n; }
+    }
+    let capsLifted = !setsFirst;
+    // Sets first: cycle the parts biggest first, so a large part is not
+    // squeezed out of every row by the small ones that come before it in
+    // the import order. Plain copies keep the import order (cut sequence).
+    const cycle = setsFirst
+      ? partDefs.slice().sort((a, b) => PU.area(b.pts) - PU.area(a.pts) || (String(a.id) < String(b.id) ? -1 : 1))
+      : partDefs;
+    const liftCaps = () => {
+      if (capsLifted) return false;
+      capsLifted = true;
+      for (const p of partDefs) copiesLeft.set(p.id, maxTotal);
+      return true;
+    };
+    const allCapsReached = () => {
+      for (const v of copiesLeft.values()) if (v > 0) return false;
+      return true;
+    };
 
     const skyW = Math.ceil(usW) + 2;
     const skyline = new Float64Array(skyW);
@@ -2768,6 +2924,7 @@ const PolyNestEngine = {
       try { _emit({ placement, totalPlaced: placed.length, sheetIdx: 0 }); } catch(_){}
       copiesLeft.set(part.id, (copiesLeft.get(part.id) || 0) - 1);
       placedCount++;
+      if (setsFirst && !capsLifted && allCapsReached()) liftCaps();
     };
 
     // ────── PHASE 1: ORDERED ROW FILL ──────
@@ -2793,7 +2950,7 @@ const PolyNestEngine = {
 
         const useA = (rowNum + posInRow) % 2 === 0;
         const partIdx = posInRow % partDefs.length;
-        const part = partDefs[partIdx];
+        const part = cycle[partIdx];
 
         if ((copiesLeft.get(part.id) || 0) <= 0) {
           posInRow++;
@@ -2839,7 +2996,13 @@ const PolyNestEngine = {
     let phase2FailStreak = 0;
     const MAX_PHASE2_FAILS = partDefs.length * 2;
 
-    while (placedCount < maxTotal && phase2FailStreak < MAX_PHASE2_FAILS) {
+    while (placedCount < maxTotal) {
+      if (phase2FailStreak >= MAX_PHASE2_FAILS) {
+        // Sets-first: the dead-space pass ran with the per-part caps on;
+        // now lift them and let extras use what is left.
+        if (!liftCaps()) break;
+        phase2FailStreak = 0;
+      }
       if (isCancelled && isCancelled()) break;
 
       const now = performance.now();
@@ -2852,7 +3015,7 @@ const PolyNestEngine = {
 
       const useA = phase2Step % 2 === 0;
       const partIdx = Math.floor(phase2Step / 2) % partDefs.length;
-      const part = partDefs[partIdx];
+      const part = cycle[partIdx];
 
       if ((copiesLeft.get(part.id) || 0) <= 0) {
         phase2Step++;
@@ -2875,11 +3038,20 @@ const PolyNestEngine = {
     }
 
     const sheets = [{ idx: 0, placements: placed }];
-    return {
+    const out = {
       placements: placed, sheets, placed: placedCount,
       unplaced: Math.max(0, maxTotal - placedCount),
       sheetCount: 1, usableW: usW, usableH: usH, effRes: 'polygon', cuttingFlow: true
     };
+    if (setsFirst) {
+      const byId = new Map(partDefs.map(p => [p.id, 0]));
+      for (const pl of placed) byId.set(pl.partId, (byId.get(pl.partId) || 0) + 1);
+      const complete = Math.min(...byId.values());
+      out.sets = { requested: copies, complete, partsPerSet: partDefs.length,
+        perPart: partDefs.map(p => ({ id: p.id, name: p.name + (p._mustPairTag === 'mir' ? ' (mirrored)' : ''), placed: byId.get(p.id) })) };
+      out.unplaced = Math.max(0, copies * partDefs.length - [...byId.values()].reduce((a, n) => a + Math.min(n, copies), 0));
+    }
+    return out;
   },
 };
 

@@ -99,6 +99,14 @@ const Renderer = {
         return;
       }
 
+      // Measure tool: a left click is a measuring point, never a selection
+      // or a drag start; the mouseup below turns a still click into a point.
+      // Dragging still pans, so the user can move around while measuring.
+      if (!isRightClick && typeof Measure !== 'undefined' && Measure.active) {
+        dragging = true; lastX = e.clientX; lastY = e.clientY;
+        pressX = e.clientX; pressY = e.clientY; totalDrag = 0;
+        return;
+      }
       // Left-click on SELECTED placement in edit mode → normal drag
       if (!isRightClick && App && App._selectedPlacementIdx != null && App._selectedPlacementIdx >= 0
           && App._placementEditMode && App._placementEditMode !== 'none') {
@@ -128,7 +136,11 @@ const Renderer = {
       if (dragging) {
         // If this was a CLICK (minimal drag) and defect edit mode is on,
         // convert screen coords to sheet-space mm and add/remove defect.
-        if (totalDrag < 5 && App && App._defectEditMode) {
+        if (totalDrag < 5 && typeof Measure !== 'undefined' && Measure.active) {
+          const s = toSheet(e.clientX, e.clientY);
+          Measure.onClick(s.x, s.y);
+          this._lastClickHandled = Date.now();
+        } else if (totalDrag < 5 && App && App._defectEditMode) {
           const rect = this.canvas.getBoundingClientRect();
           const mx = e.clientX - rect.left;
           const my = e.clientY - rect.top;
@@ -153,6 +165,7 @@ const Renderer = {
     // ALSO add direct click handler as fallback (in case mouseup misses)
     this.canvas.addEventListener('click', e => {
       if (App && App._defectEditMode) return;  // handled by mouseup path
+      if (typeof Measure !== 'undefined' && Measure.active) return;  // handled by mouseup path
       if (!App || !App.nestResult) return;
       // Only handle if mouseup didn't already fire (totalDrag tracker would be reset)
       if (this._lastClickHandled && Date.now() - this._lastClickHandled < 100) return;
@@ -173,7 +186,14 @@ const Renderer = {
         App._updatePlacementDrag(s.x, s.y, placementDragState);
         return;
       }
-      if (!dragging) return;
+      if (!dragging) {
+        // Measure tool: live snap marker and rubber-band line under the mouse
+        if (typeof Measure !== 'undefined' && Measure.active && e.target === this.canvas) {
+          const s = toSheet(e.clientX, e.clientY);
+          Measure.onMove(s.x, s.y);
+        }
+        return;
+      }
       const dx = e.clientX - lastX, dy = e.clientY - lastY;
       totalDrag += Math.abs(dx) + Math.abs(dy);
       // If defect edit mode, don't pan on drag — reserve drag for future defect-resize feature
@@ -570,6 +590,9 @@ const Renderer = {
       // Preview mode: draw parts in top-left corner
       this.drawPreview();
     }
+
+    // Measure tool overlay (dimension lines, snap markers), on top of everything
+    if (typeof Measure !== 'undefined') Measure.draw(ctx, zoom);
 
     ctx.restore();
   },
