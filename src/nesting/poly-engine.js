@@ -614,11 +614,11 @@ const PolyNestEngine = {
           .slice(0, 50);
         const stillUnplaced = [];
         let placedThisRetry = 0;
-        const retryStart = performance.now();
-        const RETRY_BUDGET_MS = 5000;
+        // Bounded by the 50-attempt cap above, not by a clock: a wall-clock
+        // limit here made the layout vary from run to run (measured: the old
+        // 5 s limit stopped the loop at 44-49 attempts, differently each time).
         for (const part of retryQueue) {
           if (isCancelled && isCancelled()) break;
-          if (performance.now() - retryStart > RETRY_BUDGET_MS) break;
           const variants = variantsByPart.get(part.id);
           // Set per-part zone check (used inside placeBest)
           // RETRY PASS: Zone rules remain STRICT. Unrestricted parts still
@@ -752,8 +752,10 @@ const PolyNestEngine = {
 
           if (phase3Queue.length > 0) {
             console.log(`[NestForge Phase 3] ${phase3Queue.length} unrestricted parts retry into ALL reserved zones [${[...releasedZones].join(',')}] (restricted parts already attempted)`);
-            const phase3Start = performance.now();
-            const PHASE3_BUDGET_MS = 3000;
+            // A count, not a clock, so the result does not depend on machine
+            // speed. Generous: the old 3 s allowed far fewer attempts than this.
+            const PHASE3_MAX_ATTEMPTS = 200;
+            let phase3Attempts = 0;
             const phase3Tried = new Set();
             const phase3Placed = [];
 
@@ -787,7 +789,7 @@ const PolyNestEngine = {
 
             for (const part of phase3Sorted) {
               if (isCancelled && isCancelled()) break;
-              if (performance.now() - phase3Start > PHASE3_BUDGET_MS) break;
+              if (++phase3Attempts > PHASE3_MAX_ATTEMPTS) break;
               phase3Tried.add(part._uid);
               const variants = variantsByPart.get(part.id);
               // Relaxed zone check: allow non-reserved OR released zones
@@ -879,8 +881,13 @@ const PolyNestEngine = {
 
       if (!unplacedItems || unplacedItems.length === 0) return;
 
-      const PHASE4_BUDGET_MS = 8000;
-      const phase4Start = performance.now();
+      // Deterministic instead of a wall-clock budget: every (shape, rotation,
+      // position) is evaluated at most once (see p4Cursor below), so a normal
+      // job finishes in well under a second. The cap only guards pathological
+      // input, and it is a count, so the result never depends on machine speed.
+      const PHASE4_MAX_EVALS = 2000000;
+      let phase4Evals = 0;
+      let phase4Capped = false;
 
       const placedOutsets = placed.map(pl => {
         const wp = pl.worldPoly || PU.translate(pl.pts, pl.x - margin, pl.y - margin);
@@ -988,13 +995,15 @@ const PolyNestEngine = {
 
       const phase4Placed = [];
       const p4Queue = unplacedItems.slice().sort((a, b) => PU.area(b.pts) - PU.area(a.pts));
+      // First candidate index not yet known to fail, per (shape, rotation, rule).
+      // A rejection is permanent within Phase 4 (placements are only added and
+      // can only take space away), so later parts of the same shape resume the
+      // scan here and get the same first fit the full scan would have found.
+      const p4Cursor = new Map();
 
       for (const part of p4Queue) {
         if (isCancelled && isCancelled()) break;
-        if (performance.now() - phase4Start > PHASE4_BUDGET_MS) {
-          console.log('[NestForge Phase 4] budget exhausted');
-          break;
-        }
+        if (phase4Capped) break;
         const variants = variantsByPart.get(part.id);
         if (!variants || !variants.length) continue;
 
@@ -1027,16 +1036,30 @@ const PolyNestEngine = {
         }
 
         let found = null;
-        outer: for (const v of variants) {
+        const p4Shape = shapeHashByPart.get(part.id) || part.id;
+        for (const v of variants) {
           const vbb = PU.bbox(v.pts);
-          for (const [cx, cy] of candidates) {
+          const ck = p4Shape + '|' + v.key + '|' + (partKey || '');
+          let ci = p4Cursor.get(ck) || 0;
+          for (; ci < candidates.length; ci++) {
+            if (++phase4Evals > PHASE4_MAX_EVALS) {
+              if (!phase4Capped) console.log('[NestForge Phase 4] evaluation cap reached');
+              phase4Capped = true;
+              break;
+            }
+            const [cx, cy] = candidates[ci];
             const x = cx - vbb.x;
             const y = cy - vbb.y;
             if (fitsAt(v, x, y, zoneCheck)) {
               found = { v, x, y };
-              break outer;
+              break;
             }
           }
+          // Everything before ci is rejected for good. If found, ci is the
+          // position just taken; the next part of this shape re-tests it,
+          // finds it occupied, and moves on.
+          p4Cursor.set(ck, ci);
+          if (found || phase4Capped) break;
         }
 
         if (found) {
@@ -1149,14 +1172,58 @@ const PolyNestEngine = {
       let passIdx = 0;
       let earlyExit = false;
       const passResults = [];  // diagnostic: track every pass for honest reporting
+
+      // ── Compute all passes at once, choose exactly as below ──────────
+      // Each pass is deterministic and independent (no randomness, every
+      // limit is a count, fresh engine state per worker), so a pass gives the
+      // same result in a worker as it would here. The loop below then walks
+      // the results in the original order, with the original comparison and
+      // the original early-exit rule, so the winner is the one the
+      // one-by-one loop would have chosen. First sheet only: later sheets
+      // nest what the previous sheet left, which a worker cannot rebuild.
+      let precomputed = null;
+      // Below ~48 queued parts a pass takes well under a second and starting
+      // workers costs more than it saves (measured: a 16-part job went from
+      // 1.1 s to 1.3 s). Small jobs stay on the one-by-one loop.
+      const PARALLEL_MIN_QUEUE = 48;
+      if (queue === baseQueue && totalPasses >= 3 && queue.length >= PARALLEL_MIN_QUEUE && !settings._singlePass
+          && typeof EngineWorkers !== 'undefined' && EngineWorkers.mode !== 'sequential'
+          && !(isCancelled && isCancelled())) {
+        const jobs = [];
+        for (let oi = 0; oi < orderings.length; oi++) {
+          for (const cavityAware of cavityModes) {
+            jobs.push({ kind: 'nestPass', partDefs,
+              settings: Object.assign({}, settings, { _singlePass: { ordering: oi, cavityAware } }) });
+          }
+        }
+        const t0 = performance.now();
+        try {
+          precomputed = await EngineWorkers.run(jobs,
+            (f, msg) => onProgress(progressOffset + f * progressScale, msg), isCancelled, 'passes');
+          console.log(`[NestForge] ${totalPasses} passes in parallel on ` +
+            `${Math.min(totalPasses, EngineWorkers.threads())} workers in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+        } catch (err) {
+          if (EngineWorkers.mode === 'parallel') throw err;
+          console.warn('[NestForge] parallel passes not available (' + ((err && err.message) || err) +
+            '), running them one by one');
+          precomputed = null;
+        }
+      }
+
       for (let oi = 0; oi < orderings.length; oi++) {
         for (const cavityAware of cavityModes) {
           if (isCancelled && isCancelled()) break;
-          const q = [...queue].sort(orderings[oi]);
-          const prog = (pct, msg) => onProgress(
-            progressOffset + (passIdx + pct) / totalPasses * progressScale,
-            `Ordering ${oi + 1}${cavityAware ? ' +cavity' : ''}: ${msg}`);
-          const r = await runPass(q, prog, cavityAware);
+          let r;
+          if (precomputed) {
+            r = precomputed[passIdx];
+            if (!r) break;   // only missing if cancelled mid-run, as the loop above would break
+          } else {
+            const q = [...queue].sort(orderings[oi]);
+            const prog = (pct, msg) => onProgress(
+              progressOffset + (passIdx + pct) / totalPasses * progressScale,
+              `Ordering ${oi + 1}${cavityAware ? ' +cavity' : ''}: ${msg}`);
+            r = await runPass(q, prog, cavityAware);
+          }
           const passLabel = `Ord${oi + 1}${cavityAware ? '+cav' : '+BL'}`;
           const score = scorePass(r);
           passResults.push({ label: passLabel, placed: r.placed, unplaced: r.unplaced, maxX: r.maxX, maxY: r.maxY, score });
@@ -1182,6 +1249,13 @@ const PolyNestEngine = {
           console.log(`  ${p.label}: placed=${p.placed}${marker}`);
         }
       }
+      // The workers could not stream placements to the live preview; show
+      // the chosen layout now. (Sequential passes streamed as they ran.)
+      if (precomputed && bestPass && bestPass.placements) {
+        for (let i = 0; i < bestPass.placements.length; i++) {
+          try { _emit({ placement: bestPass.placements[i], totalPlaced: i + 1, sheetIdx: 0 }); } catch (_) {}
+        }
+      }
       // Run Phase 4 edge-fill exactly ONCE on the winning result
       if (bestPass && bestPass.unplaced > 0) {
         const beforePhase4 = bestPass.placed;
@@ -1192,6 +1266,18 @@ const PolyNestEngine = {
       }
       return bestPass;
     };
+
+    // ── WORKER MODE: one pass of the first sheet, raw ──────────────────
+    // EngineWorkers runs nest() in a worker with settings._singlePass set.
+    // Everything above was built exactly as for a normal run (same code,
+    // same inputs), so the pass sees the same queue, variants and zones.
+    // The page-side singleSheetBestPass() collects six of these and
+    // chooses among them with the same rule as its one-by-one loop.
+    if (settings._singlePass) {
+      const sp = settings._singlePass;
+      const q = [...baseQueue].sort(orderings[sp.ordering]);
+      return await runPass(q, (pct, msg) => onProgress(pct, msg), !!sp.cavityAware);
+    }
 
     // ── MAIN LOOP: single sheet OR overflow to many sheets ──
     const MAX_SHEETS = 50;  // safety limit — avoid infinite loops on degenerate input
@@ -1809,15 +1895,19 @@ const PolyNestEngine = {
     const placedBBoxes = [];
     for (const p of placed) placedBBoxes.push(PU.bbox(p.worldPoly));
     let lastYield = performance.now();
-    const startTime = performance.now();
     // Hard time budget: 1 second per part. If a part can't find a spot in
     // 1 second, the nest is too tight for it anyway — move on. This is the
     // most effective way to prevent slow nests since individual-part time
     // is bounded.
-    const TIME_BUDGET_MS = 3000;
+    // Per-part limit as a count of candidate positions examined, not seconds,
+    // so a part's placement never depends on how fast the machine is. On the
+    // profiled jobs the old 3 s limit was never reached; this cap is far
+    // above what 3 s allowed, and exists only to bound pathological input.
+    const MAX_CANDIDATE_EVALS = 200000;
+    let candidateEvals = 0;
     for (let vi = 0; vi < variants.length; vi++) {
       // Abandon if we've spent too long on this single part
-      if (performance.now() - startTime > TIME_BUDGET_MS) break;
+      if (candidateEvals > MAX_CANDIDATE_EVALS) break;
       // Yield between variants — 20ms budget to stay responsive
       const now = performance.now();
       if (now - lastYield > 20) {
@@ -1879,9 +1969,10 @@ const PolyNestEngine = {
       for (const hit of positionsToTry) {
         // Tighter yield schedule — every 8 candidates, 20ms budget.
         candIdx++;
+        candidateEvals++;
         if ((candIdx & 7) === 0) {
           // Time budget hard cap
-          if (performance.now() - startTime > TIME_BUDGET_MS) return best;
+          if (candidateEvals > MAX_CANDIDATE_EVALS) return best;
           const nowY = performance.now();
           if (nowY - lastYield > 20) {
             if (isCancelled && isCancelled()) return best;
@@ -2225,7 +2316,52 @@ const PolyNestEngine = {
        candidates: array of {x, y} — all vertex/midpoint positions
        perPolyBL: array of {x, y} — the BL point of each feasible polygon
          (one entry per disconnected region of valid positions)  */
+  // ── placeOne memo ───────────────────────────────────────────────────
+  // The Clipper difference in _placeOneUncached() is the single most
+  // expensive operation in the engine: on a real fill-mode job it was 75% of
+  // the total run, because every rotation of every queued part recomputes
+  // "sheet minus all placed NFPs" from scratch, and most queued parts in fill
+  // mode fail to fit. Within a pass the placed list only grows, so a call with
+  // the same incoming variant against the same placed list is the same
+  // computation. This returns the earlier result instead.
+  //
+  // Correctness: the memo is keyed by the identity of every placement object
+  // in `placed`, in order, plus the incoming variant, sheet and gap. Any
+  // mutation of the list, or a different list, misses and recomputes. Only
+  // the current length is kept, so memory stays at a few entries per pass.
+  // Placement objects are never modified after creation, so identity
+  // identifies content. Results are the uncached function's own objects, so
+  // they are bit-identical; the arrays are copied so a caller cannot alter
+  // what a later hit receives.
+  _placeOneMemo: new WeakMap(),
+
   placeOne(partPts, placed, sheetW, sheetH, gap, thisPartId, thisVKey, nfpCache) {
+    if (!Array.isArray(placed) || !thisVKey) {
+      return this._placeOneUncached(partPts, placed, sheetW, sheetH, gap, thisPartId, thisVKey, nfpCache);
+    }
+    let memo = this._placeOneMemo.get(placed);
+    let same = !!memo && memo.refs.length === placed.length;
+    if (same) {
+      const refs = memo.refs;
+      for (let i = 0; i < refs.length; i++) { if (refs[i] !== placed[i]) { same = false; break; } }
+    }
+    if (!same) {
+      memo = { refs: placed.slice(), entries: new Map() };
+      this._placeOneMemo.set(placed, memo);
+    }
+    const bb = PU.bbox(partPts);
+    const key = thisPartId + '|' + thisVKey + '|' + gap + '|' + sheetW + '|' + sheetH + '|' +
+      partPts.length + '|' + bb.minX + '|' + bb.minY + '|' + bb.maxX + '|' + bb.maxY;
+    let hit = memo.entries.get(key);
+    if (hit === undefined) {
+      hit = this._placeOneUncached(partPts, placed, sheetW, sheetH, gap, thisPartId, thisVKey, nfpCache);
+      memo.entries.set(key, hit);
+    }
+    if (hit === null) return null;
+    return { candidates: hit.candidates.slice(), perPolyBL: hit.perPolyBL.slice() };
+  },
+
+  _placeOneUncached(partPts, placed, sheetW, sheetH, gap, thisPartId, thisVKey, nfpCache) {
     const ifp = NFP.computeIFP(sheetW, sheetH, partPts);
     if (!ifp) return null;
 

@@ -495,12 +495,13 @@ const NestEngineRaster = {
             }
             // Try to place each unrestricted unplaced part with the relaxed mask
             const phase3Placed = new Set();
-            const phase3Start = performance.now();
-            const PHASE3_BUDGET_MS = 3000;
+            // A count, not a clock, so the result does not depend on machine speed.
+            const PHASE3_MAX_ATTEMPTS = 200;
+            let phase3Attempts = 0;
             const phase3Sorted = phase3Queue.slice().sort((a, b) => polyArea(b.pts) - polyArea(a.pts));
             for (const part of phase3Sorted) {
               if (isCancelled && isCancelled()) break;
-              if (performance.now() - phase3Start > PHASE3_BUDGET_MS) break;
+              if (++phase3Attempts > PHASE3_MAX_ATTEMPTS) break;
               const variants = vc.get(part.id);
               const denseMode = fillSheet || multiSheet;
               const pl = await this.place(variants, _grid, GW, GH, _sky, _curMaxX, _curMaxY, denseMode, isCancelled, phase3Mask);

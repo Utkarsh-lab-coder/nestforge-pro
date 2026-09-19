@@ -4144,12 +4144,13 @@ const NestEngineRaster = {
             }
             // Try to place each unrestricted unplaced part with the relaxed mask
             const phase3Placed = new Set();
-            const phase3Start = performance.now();
-            const PHASE3_BUDGET_MS = 3000;
+            // A count, not a clock, so the result does not depend on machine speed.
+            const PHASE3_MAX_ATTEMPTS = 200;
+            let phase3Attempts = 0;
             const phase3Sorted = phase3Queue.slice().sort((a, b) => polyArea(b.pts) - polyArea(a.pts));
             for (const part of phase3Sorted) {
               if (isCancelled && isCancelled()) break;
-              if (performance.now() - phase3Start > PHASE3_BUDGET_MS) break;
+              if (++phase3Attempts > PHASE3_MAX_ATTEMPTS) break;
               const variants = vc.get(part.id);
               const denseMode = fillSheet || multiSheet;
               const pl = await this.place(variants, _grid, GW, GH, _sky, _curMaxX, _curMaxY, denseMode, isCancelled, phase3Mask);
@@ -13585,11 +13586,11 @@ const PolyNestEngine = {
           .slice(0, 50);
         const stillUnplaced = [];
         let placedThisRetry = 0;
-        const retryStart = performance.now();
-        const RETRY_BUDGET_MS = 5000;
+        // Bounded by the 50-attempt cap above, not by a clock: a wall-clock
+        // limit here made the layout vary from run to run (measured: the old
+        // 5 s limit stopped the loop at 44-49 attempts, differently each time).
         for (const part of retryQueue) {
           if (isCancelled && isCancelled()) break;
-          if (performance.now() - retryStart > RETRY_BUDGET_MS) break;
           const variants = variantsByPart.get(part.id);
           // Set per-part zone check (used inside placeBest)
           // RETRY PASS: Zone rules remain STRICT. Unrestricted parts still
@@ -13723,8 +13724,10 @@ const PolyNestEngine = {
 
           if (phase3Queue.length > 0) {
             console.log(`[NestForge Phase 3] ${phase3Queue.length} unrestricted parts retry into ALL reserved zones [${[...releasedZones].join(',')}] (restricted parts already attempted)`);
-            const phase3Start = performance.now();
-            const PHASE3_BUDGET_MS = 3000;
+            // A count, not a clock, so the result does not depend on machine
+            // speed. Generous: the old 3 s allowed far fewer attempts than this.
+            const PHASE3_MAX_ATTEMPTS = 200;
+            let phase3Attempts = 0;
             const phase3Tried = new Set();
             const phase3Placed = [];
 
@@ -13758,7 +13761,7 @@ const PolyNestEngine = {
 
             for (const part of phase3Sorted) {
               if (isCancelled && isCancelled()) break;
-              if (performance.now() - phase3Start > PHASE3_BUDGET_MS) break;
+              if (++phase3Attempts > PHASE3_MAX_ATTEMPTS) break;
               phase3Tried.add(part._uid);
               const variants = variantsByPart.get(part.id);
               // Relaxed zone check: allow non-reserved OR released zones
@@ -13850,8 +13853,13 @@ const PolyNestEngine = {
 
       if (!unplacedItems || unplacedItems.length === 0) return;
 
-      const PHASE4_BUDGET_MS = 8000;
-      const phase4Start = performance.now();
+      // Deterministic instead of a wall-clock budget: every (shape, rotation,
+      // position) is evaluated at most once (see p4Cursor below), so a normal
+      // job finishes in well under a second. The cap only guards pathological
+      // input, and it is a count, so the result never depends on machine speed.
+      const PHASE4_MAX_EVALS = 2000000;
+      let phase4Evals = 0;
+      let phase4Capped = false;
 
       const placedOutsets = placed.map(pl => {
         const wp = pl.worldPoly || PU.translate(pl.pts, pl.x - margin, pl.y - margin);
@@ -13959,13 +13967,15 @@ const PolyNestEngine = {
 
       const phase4Placed = [];
       const p4Queue = unplacedItems.slice().sort((a, b) => PU.area(b.pts) - PU.area(a.pts));
+      // First candidate index not yet known to fail, per (shape, rotation, rule).
+      // A rejection is permanent within Phase 4 (placements are only added and
+      // can only take space away), so later parts of the same shape resume the
+      // scan here and get the same first fit the full scan would have found.
+      const p4Cursor = new Map();
 
       for (const part of p4Queue) {
         if (isCancelled && isCancelled()) break;
-        if (performance.now() - phase4Start > PHASE4_BUDGET_MS) {
-          console.log('[NestForge Phase 4] budget exhausted');
-          break;
-        }
+        if (phase4Capped) break;
         const variants = variantsByPart.get(part.id);
         if (!variants || !variants.length) continue;
 
@@ -13998,16 +14008,30 @@ const PolyNestEngine = {
         }
 
         let found = null;
-        outer: for (const v of variants) {
+        const p4Shape = shapeHashByPart.get(part.id) || part.id;
+        for (const v of variants) {
           const vbb = PU.bbox(v.pts);
-          for (const [cx, cy] of candidates) {
+          const ck = p4Shape + '|' + v.key + '|' + (partKey || '');
+          let ci = p4Cursor.get(ck) || 0;
+          for (; ci < candidates.length; ci++) {
+            if (++phase4Evals > PHASE4_MAX_EVALS) {
+              if (!phase4Capped) console.log('[NestForge Phase 4] evaluation cap reached');
+              phase4Capped = true;
+              break;
+            }
+            const [cx, cy] = candidates[ci];
             const x = cx - vbb.x;
             const y = cy - vbb.y;
             if (fitsAt(v, x, y, zoneCheck)) {
               found = { v, x, y };
-              break outer;
+              break;
             }
           }
+          // Everything before ci is rejected for good. If found, ci is the
+          // position just taken; the next part of this shape re-tests it,
+          // finds it occupied, and moves on.
+          p4Cursor.set(ck, ci);
+          if (found || phase4Capped) break;
         }
 
         if (found) {
@@ -14120,14 +14144,58 @@ const PolyNestEngine = {
       let passIdx = 0;
       let earlyExit = false;
       const passResults = [];  // diagnostic: track every pass for honest reporting
+
+      // ── Compute all passes at once, choose exactly as below ──────────
+      // Each pass is deterministic and independent (no randomness, every
+      // limit is a count, fresh engine state per worker), so a pass gives the
+      // same result in a worker as it would here. The loop below then walks
+      // the results in the original order, with the original comparison and
+      // the original early-exit rule, so the winner is the one the
+      // one-by-one loop would have chosen. First sheet only: later sheets
+      // nest what the previous sheet left, which a worker cannot rebuild.
+      let precomputed = null;
+      // Below ~48 queued parts a pass takes well under a second and starting
+      // workers costs more than it saves (measured: a 16-part job went from
+      // 1.1 s to 1.3 s). Small jobs stay on the one-by-one loop.
+      const PARALLEL_MIN_QUEUE = 48;
+      if (queue === baseQueue && totalPasses >= 3 && queue.length >= PARALLEL_MIN_QUEUE && !settings._singlePass
+          && typeof EngineWorkers !== 'undefined' && EngineWorkers.mode !== 'sequential'
+          && !(isCancelled && isCancelled())) {
+        const jobs = [];
+        for (let oi = 0; oi < orderings.length; oi++) {
+          for (const cavityAware of cavityModes) {
+            jobs.push({ kind: 'nestPass', partDefs,
+              settings: Object.assign({}, settings, { _singlePass: { ordering: oi, cavityAware } }) });
+          }
+        }
+        const t0 = performance.now();
+        try {
+          precomputed = await EngineWorkers.run(jobs,
+            (f, msg) => onProgress(progressOffset + f * progressScale, msg), isCancelled, 'passes');
+          console.log(`[NestForge] ${totalPasses} passes in parallel on ` +
+            `${Math.min(totalPasses, EngineWorkers.threads())} workers in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+        } catch (err) {
+          if (EngineWorkers.mode === 'parallel') throw err;
+          console.warn('[NestForge] parallel passes not available (' + ((err && err.message) || err) +
+            '), running them one by one');
+          precomputed = null;
+        }
+      }
+
       for (let oi = 0; oi < orderings.length; oi++) {
         for (const cavityAware of cavityModes) {
           if (isCancelled && isCancelled()) break;
-          const q = [...queue].sort(orderings[oi]);
-          const prog = (pct, msg) => onProgress(
-            progressOffset + (passIdx + pct) / totalPasses * progressScale,
-            `Ordering ${oi + 1}${cavityAware ? ' +cavity' : ''}: ${msg}`);
-          const r = await runPass(q, prog, cavityAware);
+          let r;
+          if (precomputed) {
+            r = precomputed[passIdx];
+            if (!r) break;   // only missing if cancelled mid-run, as the loop above would break
+          } else {
+            const q = [...queue].sort(orderings[oi]);
+            const prog = (pct, msg) => onProgress(
+              progressOffset + (passIdx + pct) / totalPasses * progressScale,
+              `Ordering ${oi + 1}${cavityAware ? ' +cavity' : ''}: ${msg}`);
+            r = await runPass(q, prog, cavityAware);
+          }
           const passLabel = `Ord${oi + 1}${cavityAware ? '+cav' : '+BL'}`;
           const score = scorePass(r);
           passResults.push({ label: passLabel, placed: r.placed, unplaced: r.unplaced, maxX: r.maxX, maxY: r.maxY, score });
@@ -14153,6 +14221,13 @@ const PolyNestEngine = {
           console.log(`  ${p.label}: placed=${p.placed}${marker}`);
         }
       }
+      // The workers could not stream placements to the live preview; show
+      // the chosen layout now. (Sequential passes streamed as they ran.)
+      if (precomputed && bestPass && bestPass.placements) {
+        for (let i = 0; i < bestPass.placements.length; i++) {
+          try { _emit({ placement: bestPass.placements[i], totalPlaced: i + 1, sheetIdx: 0 }); } catch (_) {}
+        }
+      }
       // Run Phase 4 edge-fill exactly ONCE on the winning result
       if (bestPass && bestPass.unplaced > 0) {
         const beforePhase4 = bestPass.placed;
@@ -14163,6 +14238,18 @@ const PolyNestEngine = {
       }
       return bestPass;
     };
+
+    // ── WORKER MODE: one pass of the first sheet, raw ──────────────────
+    // EngineWorkers runs nest() in a worker with settings._singlePass set.
+    // Everything above was built exactly as for a normal run (same code,
+    // same inputs), so the pass sees the same queue, variants and zones.
+    // The page-side singleSheetBestPass() collects six of these and
+    // chooses among them with the same rule as its one-by-one loop.
+    if (settings._singlePass) {
+      const sp = settings._singlePass;
+      const q = [...baseQueue].sort(orderings[sp.ordering]);
+      return await runPass(q, (pct, msg) => onProgress(pct, msg), !!sp.cavityAware);
+    }
 
     // ── MAIN LOOP: single sheet OR overflow to many sheets ──
     const MAX_SHEETS = 50;  // safety limit — avoid infinite loops on degenerate input
@@ -14780,15 +14867,19 @@ const PolyNestEngine = {
     const placedBBoxes = [];
     for (const p of placed) placedBBoxes.push(PU.bbox(p.worldPoly));
     let lastYield = performance.now();
-    const startTime = performance.now();
     // Hard time budget: 1 second per part. If a part can't find a spot in
     // 1 second, the nest is too tight for it anyway — move on. This is the
     // most effective way to prevent slow nests since individual-part time
     // is bounded.
-    const TIME_BUDGET_MS = 3000;
+    // Per-part limit as a count of candidate positions examined, not seconds,
+    // so a part's placement never depends on how fast the machine is. On the
+    // profiled jobs the old 3 s limit was never reached; this cap is far
+    // above what 3 s allowed, and exists only to bound pathological input.
+    const MAX_CANDIDATE_EVALS = 200000;
+    let candidateEvals = 0;
     for (let vi = 0; vi < variants.length; vi++) {
       // Abandon if we've spent too long on this single part
-      if (performance.now() - startTime > TIME_BUDGET_MS) break;
+      if (candidateEvals > MAX_CANDIDATE_EVALS) break;
       // Yield between variants — 20ms budget to stay responsive
       const now = performance.now();
       if (now - lastYield > 20) {
@@ -14850,9 +14941,10 @@ const PolyNestEngine = {
       for (const hit of positionsToTry) {
         // Tighter yield schedule — every 8 candidates, 20ms budget.
         candIdx++;
+        candidateEvals++;
         if ((candIdx & 7) === 0) {
           // Time budget hard cap
-          if (performance.now() - startTime > TIME_BUDGET_MS) return best;
+          if (candidateEvals > MAX_CANDIDATE_EVALS) return best;
           const nowY = performance.now();
           if (nowY - lastYield > 20) {
             if (isCancelled && isCancelled()) return best;
@@ -15196,7 +15288,52 @@ const PolyNestEngine = {
        candidates: array of {x, y} — all vertex/midpoint positions
        perPolyBL: array of {x, y} — the BL point of each feasible polygon
          (one entry per disconnected region of valid positions)  */
+  // ── placeOne memo ───────────────────────────────────────────────────
+  // The Clipper difference in _placeOneUncached() is the single most
+  // expensive operation in the engine: on a real fill-mode job it was 75% of
+  // the total run, because every rotation of every queued part recomputes
+  // "sheet minus all placed NFPs" from scratch, and most queued parts in fill
+  // mode fail to fit. Within a pass the placed list only grows, so a call with
+  // the same incoming variant against the same placed list is the same
+  // computation. This returns the earlier result instead.
+  //
+  // Correctness: the memo is keyed by the identity of every placement object
+  // in `placed`, in order, plus the incoming variant, sheet and gap. Any
+  // mutation of the list, or a different list, misses and recomputes. Only
+  // the current length is kept, so memory stays at a few entries per pass.
+  // Placement objects are never modified after creation, so identity
+  // identifies content. Results are the uncached function's own objects, so
+  // they are bit-identical; the arrays are copied so a caller cannot alter
+  // what a later hit receives.
+  _placeOneMemo: new WeakMap(),
+
   placeOne(partPts, placed, sheetW, sheetH, gap, thisPartId, thisVKey, nfpCache) {
+    if (!Array.isArray(placed) || !thisVKey) {
+      return this._placeOneUncached(partPts, placed, sheetW, sheetH, gap, thisPartId, thisVKey, nfpCache);
+    }
+    let memo = this._placeOneMemo.get(placed);
+    let same = !!memo && memo.refs.length === placed.length;
+    if (same) {
+      const refs = memo.refs;
+      for (let i = 0; i < refs.length; i++) { if (refs[i] !== placed[i]) { same = false; break; } }
+    }
+    if (!same) {
+      memo = { refs: placed.slice(), entries: new Map() };
+      this._placeOneMemo.set(placed, memo);
+    }
+    const bb = PU.bbox(partPts);
+    const key = thisPartId + '|' + thisVKey + '|' + gap + '|' + sheetW + '|' + sheetH + '|' +
+      partPts.length + '|' + bb.minX + '|' + bb.minY + '|' + bb.maxX + '|' + bb.maxY;
+    let hit = memo.entries.get(key);
+    if (hit === undefined) {
+      hit = this._placeOneUncached(partPts, placed, sheetW, sheetH, gap, thisPartId, thisVKey, nfpCache);
+      memo.entries.set(key, hit);
+    }
+    if (hit === null) return null;
+    return { candidates: hit.candidates.slice(), perPolyBL: hit.perPolyBL.slice() };
+  },
+
+  _placeOneUncached(partPts, placed, sheetW, sheetH, gap, thisPartId, thisVKey, nfpCache) {
     const ifp = NFP.computeIFP(sheetW, sheetH, partPts);
     if (!ifp) return null;
 
@@ -15758,52 +15895,36 @@ const NestEngine = {
 
 </script>
 <script>
-/* ━━━━━━━━━━━━━━ INLINED FROM src/nesting/flow-strategies.js ━━━━━━━━━━━━━━ */
+/* ━━━━━━━━━━━━━━ INLINED FROM src/nesting/engine-workers.js ━━━━━━━━━━━━━━ */
 /*
- * NestForge Pro — Cutting Flow multi-strategy search, shared by both engines
+ * NestForge Pro — worker pool for the nesting engines
  *
- * Tries sixteen lane layouts, eight angles across horizontal and vertical
- * lanes, and keeps the best: the most parts placed, then the smaller used
- * height, then whichever comes first in the list.
+ * Runs independent engine jobs on Web Workers, one per spare CPU thread, so
+ * work that used to happen one job after another happens at once. Used by
+ *   - flow-strategies.js  (the 16 Cutting Flow layouts)
+ *   - poly-engine.js      (the 6 polygon-engine passes of a sheet)
  *
- * This replaces two identical copies of the search that used to live in
- * raster-engine.js and poly-engine.js. Both engines' flowNest() now call
- * FlowStrategies.run().
+ * WHY THIS CANNOT CHANGE A RESULT
+ * A job is only ever a deterministic piece of engine work: no randomness, no
+ * wall-clock limits (every limit in the engines is a count), and no shared
+ * state - each worker holds its own engine. So a job's answer does not depend
+ * on when or where it runs, and the caller combines the answers in the same
+ * order, with the same rules, as the one-after-another code it replaces.
  *
- * WHY IT CAN RUN IN PARALLEL WITH NO CHANGE IN RESULT
- * Each layout is a full, independent run of the engine's _flowNestSingle().
- * That run is deterministic: it uses no randomness and has no time limit
- * (its only timing code yields to the screen every 40 ms and never cuts the
- * work short), and it writes to no shared state - not the engine, not the
- * part list, not the settings. So a layout gives the same answer however
- * many others run beside it, and picking the winner in list order with the
- * original comparison reproduces the one-by-one result exactly.
+ * The workers run the same engine code as the page, read straight from it:
+ * the inline blocks of the built single file, or the src/ files index.html
+ * loads during development (fetch() cannot read file://, so a dev page opened
+ * from disk falls back to running jobs one by one - same result, slower).
  *
- * Layouts therefore run in Web Workers, one per spare CPU thread. If
- * workers cannot be used for any reason, the original one-by-one loop runs
- * instead, so the worst case is exactly the old behaviour.
- *
- * FlowStrategies.mode:
- *   'auto'        parallel, falling back to one by one (default)
- *   'sequential'  always one by one
- *   'parallel'    parallel only; throw rather than fall back
+ * EngineWorkers.mode: 'auto' (parallel, else fall back), 'sequential',
+ * 'parallel' (never fall back; throw instead).
  *
  * This file is loaded by index.html as a plain <script> tag — no module
- * system. It is not loaded into the workers; they only need the engines.
+ * system. It is not itself loaded into the workers.
  */
 
-const FlowStrategies = (() => {
-  const BASE_ANGLES = [0, 30, 45, 60, 90, 120, 135, 150];
-
-  // Order matters: an exact tie keeps the earlier layout.
-  const STRATEGIES = [];
-  for (const ang of BASE_ANGLES) {
-    STRATEGIES.push({ flowDir: 'horizontal', rotA: ang, rotB: (ang + 180) % 360, label: 'H-lanes ' + ang + '°' });
-    STRATEGIES.push({ flowDir: 'vertical',   rotA: ang, rotB: (ang + 180) % 360, label: 'V-lanes ' + ang + '°' });
-  }
-
-  // The engine-side modules a worker needs to run _flowNestSingle, in load
-  // order. None of them touches the page.
+const EngineWorkers = (() => {
+  // The engine-side modules a worker needs, in load order. None touches the page.
   const WORKER_MODULES = new Set([
     'src/data/hide-data.js',
     'src/geometry/clipper-shim.js',
@@ -15818,54 +15939,25 @@ const FlowStrategies = (() => {
     'src/nesting/poly-engine.js',
   ]);
 
-  const settingsFor = (settings, s) => Object.assign({}, settings, {
-    flowDir: s.flowDir, _flowRotA: s.rotA, _flowRotB: s.rotB, _flowSwapAB: false,
-  });
-
-  // The original comparison: more parts placed wins, then the smaller used
-  // height. Strict, so an exact tie keeps the earlier layout.
-  const isBetter = (r, best) => !best
-    || r.placed > best.placed
-    || (r.placed === best.placed && r.usableH < best.usableH);
-
-  function pickBest(results, tag) {
-    let best = null, bestLabel = '';
-    for (let i = 0; i < STRATEGIES.length; i++) {
-      const r = results[i];
-      if (!r) continue;
-      if (isBetter(r, best)) { best = r; bestLabel = STRATEGIES[i].label; }
-      console.log(`[CuttingFlow${tag} strategy] ${STRATEGIES[i].label}: placed=${r.placed}`);
-    }
-    return { best, bestLabel };
-  }
-
-  // ── One by one: the original loop ─────────────────────────────────────
-  async function runSequential(engine, partDefs, settings, onProgress, isCancelled) {
-    const results = new Array(STRATEGIES.length);
-    for (let si = 0; si < STRATEGIES.length; si++) {
-      const strat = STRATEGIES[si];
-      if (isCancelled && isCancelled()) break;
-      const wrapProg = (pct, msg) =>
-        onProgress((si + Math.min(pct, 1)) / STRATEGIES.length, `${strat.label} — ${msg}`);
-      // A quiet placement emitter, so the preview does not flicker between
-      // layouts. Only the winner is replayed.
-      const result = await engine._flowNestSingle(partDefs, settingsFor(settings, strat), wrapProg, isCancelled, () => {});
-      if (isCancelled && isCancelled()) break;   // a cancelled layout is partial; drop it
-      results[si] = result;
-    }
-    return results;
-  }
-
-  // ── In parallel ───────────────────────────────────────────────────────
   // What each worker runs once the engine modules are loaded into it.
+  // A job is { id, kind, ...args }. Kinds:
+  //   flowSingle  { engine: 'raster'|'poly', partDefs, settings }
+  //   nestPass    { partDefs, settings }   settings carries _singlePass
   const WORKER_MAIN = `
 self.onmessage = async (e) => {
   const job = e.data;
-  const engine = job.engine === 'poly' ? PolyNestEngine : NestEngineRaster;
+  const progress = (pct) => self.postMessage({ id: job.id, type: 'progress', pct: pct });
   try {
-    const progress = (pct) => self.postMessage({ id: job.id, type: 'progress', pct });
-    const result = await engine._flowNestSingle(job.partDefs, job.settings, progress, () => false, () => {});
-    self.postMessage({ id: job.id, type: 'done', result });
+    let result;
+    if (job.kind === 'flowSingle') {
+      const engine = job.engine === 'poly' ? PolyNestEngine : NestEngineRaster;
+      result = await engine._flowNestSingle(job.partDefs, job.settings, progress, () => false, () => {});
+    } else if (job.kind === 'nestPass') {
+      result = await PolyNestEngine.nest(job.partDefs, job.settings, progress, () => false, () => {});
+    } else {
+      throw new Error('unknown job kind ' + job.kind);
+    }
+    self.postMessage({ id: job.id, type: 'done', result: result });
   } catch (err) {
     self.postMessage({ id: job.id, type: 'error', message: String((err && err.message) || err) });
   }
@@ -15877,16 +15969,13 @@ self.postMessage({ type: 'ready',
 
   let sourcePromise = null;
 
-  // The workers run the same engine code as the page, read straight from it:
-  // the inline blocks of the built single file, or the src/ files that
-  // index.html loads during development.
   async function collectEngineSource() {
     const chunks = [];
     for (const s of Array.from(document.scripts)) {
       const src = s.getAttribute('src');
       if (src) {
         if (!WORKER_MODULES.has(src)) continue;
-        const res = await fetch(s.src);     // fails on file:// - caught, falls back
+        const res = await fetch(s.src);      // fails on file:// - caught by the caller
         if (!res.ok) throw new Error('could not read ' + src);
         chunks.push(await res.text());
       } else {
@@ -15898,32 +15987,38 @@ self.postMessage({ type: 'ready',
     return chunks;
   }
 
-  function workerCount() {
-    const threads = navigator.hardwareConcurrency || 4;
-    return Math.max(1, Math.min(STRATEGIES.length, threads - 1));   // leave one for the page
-  }
-
-  async function runParallel(engine, partDefs, settings, onProgress, isCancelled) {
-    if (typeof Worker === 'undefined' || typeof Blob === 'undefined') {
-      throw new Error('this browser has no Web Workers');
-    }
+  async function workerUrl() {
     if (!sourcePromise) sourcePromise = collectEngineSource();
     let chunks;
     try { chunks = await sourcePromise; } catch (e) { sourcePromise = null; throw e; }
-
     const source =
-      'self.window = self;\n' +              // the engines read window.ClipperLib; a worker has only self
+      'self.window = self;\n' +              // clipper-global.js reads window.ClipperLib
       chunks.join('\n;\n') + '\n;\n' +
-      // sleep() only yields to the screen, and a worker has none. Making it a
-      // microtask removes the ~4 ms timer clamp per yield. Timing only, never results.
+      // sleep() only yields to the screen, and a worker has none. A microtask
+      // avoids the ~4 ms timer clamp per yield. Timing only, never results.
       'try { sleep = () => Promise.resolve(); } catch (_) {}\n' +
       WORKER_MAIN;
-    const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    return URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+  }
 
-    const which = engine === PolyNestEngine ? 'poly' : 'raster';
-    const total = STRATEGIES.length;
-    const n = workerCount();
-    const results = new Array(total);         // layout index -> result, null if the engine returned none
+  function available() {
+    return typeof Worker !== 'undefined' && typeof Blob !== 'undefined' && typeof document !== 'undefined';
+  }
+
+  function threads() {
+    return Math.max(1, (navigator.hardwareConcurrency || 4) - 1);   // leave one for the page
+  }
+
+  // Run `jobs` (array of job objects, each given an id = its index) across up
+  // to `threads()` workers. Resolves to an array of results by job index; a job
+  // that returned nothing is null. `onProgress(fractionDone, text)`.
+  // Cancel stops every worker; results already finished are still returned.
+  async function run(jobs, onProgress, isCancelled, label) {
+    if (!available()) throw new Error('this browser has no Web Workers');
+    const url = await workerUrl();
+    const total = jobs.length;
+    const n = Math.min(total, threads());
+    const results = new Array(total);
     const pct = new Array(total).fill(0);
     const workers = [];
     let nextJob = 0, finished = 0;
@@ -15938,25 +16033,18 @@ self.postMessage({ type: 'ready',
         URL.revokeObjectURL(url);
         fn(value);
       };
-
       const report = () => {
         let sum = finished;
         for (let i = 0; i < total; i++) if (results[i] === undefined) sum += Math.min(pct[i], 1);
-        onProgress(sum / total,
-          `${finished} of ${total} layouts done, ${Math.min(n, total - finished)} running in parallel`);
+        if (onProgress) onProgress(sum / total,
+          `${finished} of ${total} ${label || 'jobs'} done, ${Math.min(n, total - finished)} running in parallel`);
       };
-
       const give = (w) => {
         if (nextJob >= total) return;
         const i = nextJob++;
-        try {
-          w.postMessage({ id: i, engine: which, partDefs, settings: settingsFor(settings, STRATEGIES[i]) });
-        } catch (err) {           // something in the parts or settings cannot be copied to a worker
-          finish(reject, err);
-        }
+        try { w.postMessage(Object.assign({ id: i }, jobs[i])); }
+        catch (err) { finish(reject, err); }   // something in the job cannot be copied to a worker
       };
-
-      // Cancelling stops every worker. As before, only layouts that finished count.
       timer = setInterval(() => { if (isCancelled && isCancelled()) finish(resolve, results); }, 100);
 
       for (let k = 0; k < n; k++) {
@@ -15987,18 +16075,97 @@ self.postMessage({ type: 'ready',
     });
   }
 
-  // ── Entry point, called by both engines' flowNest() ───────────────────
+  return { mode: 'auto', available, threads, run };
+})();
+</script>
+<script>
+/* ━━━━━━━━━━━━━━ INLINED FROM src/nesting/flow-strategies.js ━━━━━━━━━━━━━━ */
+/*
+ * NestForge Pro — Cutting Flow multi-strategy search, shared by both engines
+ *
+ * Tries sixteen lane layouts, eight angles across horizontal and vertical
+ * lanes, and keeps the best: the most parts placed, then the smaller used
+ * height, then whichever comes first in the list.
+ *
+ * This replaces two identical copies of the search that used to live in
+ * raster-engine.js and poly-engine.js. Both engines' flowNest() now call
+ * FlowStrategies.run().
+ *
+ * The layouts run in parallel through EngineWorkers. Each layout is a full,
+ * independent, deterministic run of the engine's _flowNestSingle() - no
+ * randomness, no wall-clock limit, no shared state - so it gives the same
+ * answer however many others run beside it, and picking the winner in list
+ * order with the original comparison reproduces the one-by-one result
+ * exactly. If workers cannot be used, the original one-by-one loop runs.
+ *
+ * This file is loaded by index.html as a plain <script> tag — no module
+ * system.
+ */
+
+const FlowStrategies = (() => {
+  const BASE_ANGLES = [0, 30, 45, 60, 90, 120, 135, 150];
+
+  // Order matters: an exact tie keeps the earlier layout.
+  const STRATEGIES = [];
+  for (const ang of BASE_ANGLES) {
+    STRATEGIES.push({ flowDir: 'horizontal', rotA: ang, rotB: (ang + 180) % 360, label: 'H-lanes ' + ang + '°' });
+    STRATEGIES.push({ flowDir: 'vertical',   rotA: ang, rotB: (ang + 180) % 360, label: 'V-lanes ' + ang + '°' });
+  }
+
+  const settingsFor = (settings, s) => Object.assign({}, settings, {
+    flowDir: s.flowDir, _flowRotA: s.rotA, _flowRotB: s.rotB, _flowSwapAB: false,
+  });
+
+  // The original comparison: more parts placed wins, then the smaller used
+  // height. Strict, so an exact tie keeps the earlier layout.
+  const isBetter = (r, best) => !best
+    || r.placed > best.placed
+    || (r.placed === best.placed && r.usableH < best.usableH);
+
+  function pickBest(results, tag) {
+    let best = null, bestLabel = '';
+    for (let i = 0; i < STRATEGIES.length; i++) {
+      const r = results[i];
+      if (!r) continue;
+      if (isBetter(r, best)) { best = r; bestLabel = STRATEGIES[i].label; }
+      console.log(`[CuttingFlow${tag} strategy] ${STRATEGIES[i].label}: placed=${r.placed}`);
+    }
+    return { best, bestLabel };
+  }
+
+  // One by one: the original loop.
+  async function runSequential(engine, partDefs, settings, onProgress, isCancelled) {
+    const results = new Array(STRATEGIES.length);
+    for (let si = 0; si < STRATEGIES.length; si++) {
+      const strat = STRATEGIES[si];
+      if (isCancelled && isCancelled()) break;
+      const wrapProg = (pct, msg) =>
+        onProgress((si + Math.min(pct, 1)) / STRATEGIES.length, `${strat.label} — ${msg}`);
+      const result = await engine._flowNestSingle(partDefs, settingsFor(settings, strat), wrapProg, isCancelled, () => {});
+      if (isCancelled && isCancelled()) break;   // a cancelled layout is partial; drop it
+      results[si] = result;
+    }
+    return results;
+  }
+
+  async function runParallel(engine, partDefs, settings, onProgress, isCancelled) {
+    const which = engine === PolyNestEngine ? 'poly' : 'raster';
+    const jobs = STRATEGIES.map(s => ({ kind: 'flowSingle', engine: which, partDefs, settings: settingsFor(settings, s) }));
+    return EngineWorkers.run(jobs, onProgress, isCancelled, 'layouts');
+  }
+
   async function run(engine, partDefs, settings, onProgress, isCancelled, onPlacement) {
     const tag = engine === PolyNestEngine ? ' polygon' : '';
     const t0 = performance.now();
     let results = null, how = 'one by one';
+    const mode = (typeof EngineWorkers !== 'undefined') ? EngineWorkers.mode : 'sequential';
 
-    if (api.mode !== 'sequential') {
+    if (mode !== 'sequential') {
       try {
         results = await runParallel(engine, partDefs, settings, onProgress, isCancelled);
-        how = 'in parallel on ' + workerCount() + ' workers';
+        how = 'in parallel on ' + Math.min(STRATEGIES.length, EngineWorkers.threads()) + ' workers';
       } catch (err) {
-        if (api.mode === 'parallel') throw err;
+        if (mode === 'parallel') throw err;
         console.warn('[CuttingFlow] parallel run not available (' + ((err && err.message) || err) +
           '), running the layouts one by one');
       }
@@ -16018,8 +16185,7 @@ self.postMessage({ type: 'ready',
     return best;
   }
 
-  const api = { mode: 'auto', run, STRATEGIES };
-  return api;
+  return { run, STRATEGIES };
 })();
 </script>
 <script>
