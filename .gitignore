@@ -7,3 +7,7 @@ Thumbs.db
 *.log
 *.tmp
 *.bak
+
+# desktop app: the Edge profile the shortcut uses, and the favicon PNG (embedded in index.html)
+desktop/profile
+desktop/favicon-64.png

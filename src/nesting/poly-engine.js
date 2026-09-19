@@ -1912,7 +1912,7 @@ const PolyNestEngine = {
       const now = performance.now();
       if (now - lastYield > 20) {
         if (isCancelled && isCancelled()) return best;
-        await new Promise(r => setTimeout(r, 0));
+        await sleep(0);
         lastYield = performance.now();
       }
       const v = variants[vi];
@@ -1976,7 +1976,7 @@ const PolyNestEngine = {
           const nowY = performance.now();
           if (nowY - lastYield > 20) {
             if (isCancelled && isCancelled()) return best;
-            await new Promise(r => setTimeout(r, 0));
+            await sleep(0);
             lastYield = performance.now();
           }
         }

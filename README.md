@@ -42,13 +42,21 @@ number. Projects save and reopen as JSON.
 
 ## Running it
 
+**As a desktop app (Windows).** Run `desktop\make-shortcut.ps1` once (right-click, Run with
+PowerShell). It puts a **NestForge Pro** icon on the desktop and in the Start Menu. Double-click it
+and the app opens in its own window with its own icon: no tabs, no address bar, nothing to install.
+It uses the Microsoft Edge that is already on every Windows machine as its engine, with a private
+profile kept in `desktop\profile` so it never touches your normal browser. The shortcut also tells
+Edge not to slow the app down when its window is behind another one, which browsers do by default.
+Re-run the script if you move the folder.
+
+**In a browser.** Open `dist/nestforge-pro.html`. It is one file and works with no network at all:
+the Excel, PDF and ZIP libraries are bundled inside it.
+
 | File | Use |
 |---|---|
-| `dist/nestforge-pro.html` | The whole app in one file. This is what you give people. |
+| `dist/nestforge-pro.html` | The whole app in one file, fully offline. This is what you give people. |
 | `index.html` | The same app loaded straight from `src/`. Open this while developing: edit a file, refresh, no build step. |
-
-Nesting runs fully offline. The Excel, PDF and ZIP features load JSZip, ExcelJS and jsPDF from a
-CDN, so those three need a connection.
 
 ## Building
 
@@ -76,6 +84,8 @@ src/
     dxf-parser.js           DXF entities, bulges, B-splines, splitting paths at gaps
     svg-parser.js           SVG paths
   nesting/
+    engine-workers.js       worker pool: runs deterministic engine jobs in parallel
+    flow-strategies.js      the 16-layout Cutting Flow search, shared by both engines
     rasterizer.js           rasterising polygons, gap dilation, skyline column tops
     raster-engine.js        NestEngineRaster: grid and skyline nester, Cutting Flow
     leather.js              LeatherSheet: the hide model
@@ -89,6 +99,13 @@ src/
   ui/                       worksheet-manager.js, and app.js (App: the interface and orchestration)
 vendor/
   clipper.js                Angus Johnson's Clipper 6.4.2, see THIRD-PARTY.md
+  jszip.min.js              bundled export libraries, see THIRD-PARTY.md
+  exceljs.min.js
+  jspdf.umd.min.js
+desktop/
+  make-shortcut.ps1         creates the desktop and Start Menu shortcuts
+  make-icon.py              regenerates NestForge Pro.ico and the embedded favicon
+  NestForge Pro.ico
 dist/
   nestforge-pro.html        built output
 ```

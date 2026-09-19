@@ -843,7 +843,7 @@ const NestEngineRaster = {
           const now = performance.now();
           if (now - lastYield > 30) {
             if (isCancelled && isCancelled()) return best;
-            await new Promise(r => setTimeout(r, 0));
+            await sleep(0);
             lastYield = performance.now();
           }
         }

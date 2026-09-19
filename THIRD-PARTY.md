@@ -14,10 +14,11 @@ the file.
 | JavaScript translation of Clipper | 6.4.2.2 | Timo | Boost Software License 1.0 |
 | JSBN, the big-integer library Clipper uses for exact arithmetic | | Tom Wu | BSD-style, http://www-cs-students.stanford.edu/~tjw/jsbn/LICENSE |
 
-## Loaded from a CDN at runtime
+## Bundled export libraries
 
-Not stored in this repository. They are fetched from cdnjs when the app starts, and are needed only
-for the Excel, PDF and ZIP features.
+Copied into `vendor/` from cdnjs at the exact versions the app was written against, and verified
+against cdnjs's published integrity hashes. The build inlines them into `dist/nestforge-pro.html`,
+so the app needs no network.
 
 | Component | Version | Licence |
 |---|---|---|

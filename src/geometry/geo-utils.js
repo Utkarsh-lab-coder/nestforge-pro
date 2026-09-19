@@ -55,5 +55,18 @@ function perim(pts) {
   }
   return p;
 }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// sleep(0) is how the engines yield to the screen between chunks of work.
+// It used setTimeout, which browsers throttle in a hidden or covered window
+// (to once a second, and after five minutes to once a minute): a nest that
+// takes 0.4 s in front took over five minutes behind another window. A
+// MessageChannel message is a normal task the browser can paint between,
+// and it is never throttled. Real delays (ms > 0) still use setTimeout.
+// Workers replace this with a microtask; see engine-workers.js.
+const _yieldChannel = (typeof MessageChannel !== 'undefined') ? new MessageChannel() : null;
+const _yieldQueue = [];
+if (_yieldChannel) _yieldChannel.port1.onmessage = () => { const r = _yieldQueue.shift(); if (r) r(); };
+function sleep(ms) {
+  if (ms > 0 || !_yieldChannel) return new Promise(r => setTimeout(r, ms));
+  return new Promise(r => { _yieldQueue.push(r); _yieldChannel.port2.postMessage(0); });
+}
 
